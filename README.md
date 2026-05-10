@@ -7,50 +7,89 @@
 </p>
 
 <p align="center">
-  <em>The standalone AI agent CLI lifted from <a href="../hako">hako</a>'s 零 Rei panel. Single binary. Same C99 stack.</em>
+  <em>A standalone terminal AI agent in a single C file. Quiet, model-agnostic, skill-driven.</em>
 </p>
 
 <p align="center">
-  <code>hakoc</code> — speaks Anthropic, OpenAI, Ollama, and any OpenAI-compatible endpoint. Multi-provider tool loop. Local models supported. ASan-clean.
+  <sub><b>v0.1.2</b> · <b>GPL-3.0</b> · <b>C99</b> · <b>~3.5k LOC</b> · <b>13+ providers</b> · <b>5 platforms</b></sub>
 </p>
 
 <br>
 
 ```
-  ▄█████▄    hakoCLAW v0.1.1
- ██ ███ ██   provider: anthropic
- █████████   model: claude-haiku-4-5-20251001
+  ▄█████▄    hakoCLAW v0.1.2
+ ██ ███ ██   provider: gemini
+ █████████   model: gemini-2.5-flash
  ▀█▀▀█▀▀█▀   trust: granted
 ```
 
+## Quickstart
+
+```sh
+# install (macOS · Linux · FreeBSD · WSL)
+curl -fsSL https://mithraeums.github.io/install.sh | sh
+
+# point it at a free-tier provider
+hakoc
+> /login gemini       # opens browser to console, prompts for key
+> /model gemini-2.5-flash
+> what's in this directory?
+```
+
+That's it. No card, no quota dance, no telemetry — your keys land in `~/.hakoc/state` (mode 0600) and the binary talks straight to the provider you chose.
+
 ## Overview
 
-- **One file, one binary.** `hakoCLAW.c` (~2400 LOC). Builds with `gcc -lpthread`. Curl on PATH for HTTP. Nothing else.
-- **Multi-provider.** Anthropic native, Ollama native, OpenAI function-calling, plus ten aliases (Groq, Gemini, DeepSeek, Mistral, Together, Fireworks, OpenRouter, xAI, Cerebras, custom). Local Ollama works offline; future `koi` slot reserved for [hakoAI](../hakoAI) models.
+- **One file, one binary.** `hakoCLAW.c` (~2700 LOC). Builds with `gcc -lpthread`. Curl on PATH for HTTP. Nothing else linked.
+- **Model-agnostic.** 13+ providers wired natively or via OpenAI-compatible function-calling. Local Ollama works offline. `koi` slot reserved for [hakoAI](../hakoAI) weights.
 - **Tool loop.** `read_file`, `list_dir`, `write_file` (with staging), `run_shell` (10s timeout). Schemas auto-generated for both Anthropic and function-calling formats.
-- **Trust gate.** Untrusted dir = no tool access at all. The model sees the trust error and asks the user to grant. `/trust` once per project.
-- **Sessions.** Per-cwd session id, 7-day resume rule, JSONL history log, append-only. Startup menu picks new vs resume.
-- **Streaming + animations.** Anthropic SSE streams live tokens. While waiting: 8 spinner styles × 12 thinking labels, rotated per turn (`/braille /dots /bar /pulse /bounce /ghost /arrows /blocks`).
-- **Mascot.** Default ghost lifted from hako. Drop a custom ASCII file with `--mascot <path>`.
-- **Skills.** `~/.hakoc/skills/*.md` injected into the system prompt. `/skill install <url>` to grab one from anywhere.
+- **Trust gate.** Untrusted dir = no tool access at all. `/trust` once per project; the model sees the refusal and asks you to grant.
+- **Persistent sessions + skills.** Per-cwd session id, 7-day resume rule, append-only JSONL history, startup menu picks new vs resume vs continue. Skills are markdown — flat files or directory dispatchers (corp-style) — injected at startup and pullable on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
+- **Real terminal UX.** Termios raw line editor: cursor keys, history (↑/↓), Home/End, kill-word, kill-line. Streaming SSE for Anthropic; spinner+label rotation while waiting.
+- **Self-update.** `hakoc --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
+- **Mascot + 8 spinners.** Ghost mascot from hako, `--mascot <path>` for custom ASCII. `/braille /dots /bar /pulse /bounce /ghost /arrows /blocks`.
 
 ## Install
 
-**Curl one-liner** (after first release):
+### Curl one-liner
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/<OWNER>/hakoCLAW/main/install.sh | sh
+curl -fsSL https://mithraeums.github.io/install.sh | sh
 ```
 
-Detects OS/arch, drops `hakoc` into `/usr/local/bin` (or `~/.local/bin` if not root). Override `REPO=` or `PREFIX=` env vars.
+Detects OS/arch, downloads the matching release tarball, verifies the sha256 sidecar, drops `hakoc` into `/usr/local/bin` (or `~/.local/bin` if not root). Strips the macOS quarantine xattr automatically. Override with `REPO=<owner>/<repo>`, `PREFIX=<dir>`, or `VERIFY=0` env vars.
 
-## Build
+### Platforms
+
+| OS | Arch | Asset |
+|---|---|---|
+| macOS | universal2 (arm64 + x86_64) | `hakoCLAW-macos-universal.tar.gz` |
+| Linux | x86_64 | `hakoCLAW-linux-x86_64.tar.gz` |
+| Linux | arm64 | `hakoCLAW-linux-arm64.tar.gz` |
+| FreeBSD | x86_64 | `hakoCLAW-freebsd-x86_64.tar.gz` |
+| Windows | x86_64 (MinGW) | `hakoCLAW-windows-x86_64.zip` |
+
+iSh on iOS runs the linux x86_64 build directly — no separate target needed.
+
+### Self-update
 
 ```sh
-# One-liner
+hakoc --update         # check + replace if newer
+hakoc --update-force   # re-download even if same version
+```
+
+Atomic via `rename(2)`. sha256 mandatory; refuses to install if the sidecar is missing or doesn't match.
+
+## Build from source
+
+```sh
 gcc hakoCLAW.c -o hakoc -lpthread
 
-# Or use the Makefile (also embeds icon on Windows, attaches on macOS)
+# or the Makefile (icon embed on Windows, attach on macOS, no-op on Linux)
 make
+
+# macOS universal2 (arm64 + x86_64 fat binary)
+make UNIVERSAL=1
 ```
 
 ASan + UBSan:
@@ -81,54 +120,33 @@ Custom mascot + pinned anim + debug response dump:
 hakoc --mascot ~/my_ghost.txt --anim ghost --debug
 ```
 
-## No-credit / free-tier providers
+## Providers
 
-hakoCLAW does **not** bypass paid subscriptions (Claude Pro, ChatGPT Plus). Those are tied to first-party clients. Several real free tiers work today:
+| Provider | id | Free tier? | Native? |
+|---|---|---|---|
+| Anthropic | `anthropic` / `claude` | — | yes (SSE) |
+| OpenAI | `openai` / `gpt` | — | function-calling |
+| Ollama (local) | `ollama` / `local` | ∞ | yes |
+| Gemini | `gemini` / `google` | ✓ generous | OpenAI-compat |
+| Groq | `groq` | ✓ fastest | OpenAI-compat |
+| Cerebras | `cerebras` | ✓ | OpenAI-compat |
+| OpenRouter | `openrouter` | `:free` models | OpenAI-compat |
+| Mistral | `mistral` | rate-limited | OpenAI-compat |
+| DeepSeek · Together · Fireworks · xAI · Grok · custom | varies | — | OpenAI-compat |
+| `koi` (hakoAI) | `koi` | — | aliases ollama (placeholder) |
 
-| Provider | Setup | Notes |
-|---|---|---|
-| **Gemini** (Google AI Studio) | `/login gemini` or `export GOOGLE_API_KEY=...` → aistudio.google.com/apikey | Most generous free quota. Models: `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.0-flash`, `gemini-1.5-flash` |
-| **Groq** | `/login groq` → console.groq.com/keys | Fastest. `/model llama-3.3-70b-versatile` |
-| **Cerebras** | `/login cerebras` | Free tier, very fast Llama |
-| **OpenRouter** | `/login openrouter` | Has `:free` suffixed models. e.g. `meta-llama/llama-3.3-70b-instruct:free` |
-| **Ollama** (local) | `ollama serve` + `/provider ollama` | 100% free, 0 quota, runs on your machine |
-| **Mistral** | `/login mistral` | Free tier rate-limited |
-
-Quickest path with no card:
-```sh
-hakoc
-> /login gemini
-> /model gemini-2.0-flash
-```
-
-## Providers (full list)
-
-- **Anthropic**: `anthropic` / `claude` (native API, SSE streaming when no tools)
-- **Ollama**: `ollama` / `local` (local server, native API)
-- **OpenAI**: `openai` / `gpt` (function-calling)
-- **Aliases** (OpenAI-compat): `groq` `gemini` `google` `cerebras` `deepseek` `mistral` `together` `fireworks` `openrouter` `xai` `grok` `custom`
-- **Future**: `koi` (hakoAI local model — currently aliases to ollama)
+Quickest path with no card: `hakoc` → `/login gemini` → `/model gemini-2.5-flash`.
+Does **not** bypass paid subscriptions (Claude Pro, ChatGPT Plus) — those are first-party-client-only.
 
 ## Auth
 
-Key sources, priority order:
+Key resolution order:
 1. `CLAW_API_KEY` env var (always wins)
-2. Provider-specific env vars (apply when their provider is active):
-   - Anthropic: `ANTHROPIC_API_KEY`
-   - OpenAI: `OPENAI_API_KEY`
-   - Gemini/Google: `GOOGLE_API_KEY` or `GEMINI_API_KEY`
-   - Groq: `GROQ_API_KEY`
-   - Cerebras: `CEREBRAS_API_KEY`
-   - DeepSeek: `DEEPSEEK_API_KEY`
-   - Mistral: `MISTRAL_API_KEY`
-   - Together: `TOGETHER_API_KEY`
-   - Fireworks: `FIREWORKS_API_KEY`
-   - OpenRouter: `OPENROUTER_API_KEY`
-   - xAI/Grok: `XAI_API_KEY`
+2. `<PROVIDER>_API_KEY` env var (`GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`)
 3. `~/.hakoc/state` (written by `/login`, mode 0600)
 4. `~/.hakocrc` (`ai_api_key=...`)
 
-`/login <provider>` opens the provider's console in your browser, prompts for the key (input hidden via termios), persists to `~/.hakoc/state`.
+`/login <provider>` opens the provider console in your browser, prompts for the key with input hidden, persists to `~/.hakoc/state`.
 
 ## Trust
 
@@ -141,6 +159,57 @@ First run in a directory shows:
 ```
 
 Untrusted = **all** tools refused. The model sees the trust error in tool output and asks you to grant. `/trust` to grant later, `/trust revoke` to drop.
+
+## Line editor
+
+Termios raw mode when stdin is a tty. Falls back to `getline` otherwise.
+
+| Key | Action |
+|---|---|
+| ← / → | move cursor |
+| ↑ / ↓ | history prev/next |
+| Home / End | line start/end |
+| `^A` / `^E` | line start/end |
+| `^U` | kill to start |
+| `^K` | kill to end |
+| `^W` | kill word back |
+| `^L` | clear screen |
+| `^R` | reverse-incremental history search |
+| Backspace / `^H` | delete back |
+| Delete | delete forward |
+| `^C` | cancel current line |
+| `^D` (empty line) | EOF / exit |
+
+Input history persists at `~/.hakoc/input_history` (last 500 entries, dedup-adjacent). Bracketed paste mode is enabled in raw mode — multi-line pastes batch-insert as a single edit instead of firing Enter on every newline.
+
+## Skills
+
+Skills are markdown that gets injected into the agent's system prompt at startup. Drop a file or a folder into `~/.hakoc/skills/`:
+
+```
+~/.hakoc/skills/
+├── style.md                  # flat skill — whole file injected
+└── corp/                     # directory skill — SKILL.md is the dispatcher
+    ├── SKILL.md              # injected at startup with a manifest of inner files
+    ├── README.md
+    └── .claude/agents/
+        ├── CEO.md
+        ├── DEV.md
+        └── QA.md
+```
+
+Flat (`style.md`) injects whole. Directory skills inject only `SKILL.md` plus a `<files>` manifest of every `.md` under the dir (depth ≤ 4). The agent reads inner files on demand via the `read_skill` tool — no trust gate (skills are user-installed by definition), path-traversal blocked.
+
+This is what makes [corp](https://github.com/zblauser/CORP) (multi-agent dispatcher: CEO/DEV/DESIGN/QA/ARCH) run native in claw — `SKILL.md` orients the model, then `read_skill(skill="corp", path=".claude/agents/DEV.md")` pulls the specialist on demand. The same pattern works for any skill that ships as a folder of markdown.
+
+```sh
+# install corp into claw
+git clone https://github.com/zblauser/CORP ~/.hakoc/skills/corp
+hakoc          # "loaded 1 skill(s)"
+> /skills      # confirm corp is in the manifest
+```
+
+The `read_skill` tool is exposed to the model alongside `read_file` / `list_dir` / `write_file` / `run_shell`. The system prompt tells it which skills are available and what files each contains.
 
 ## Slash commands
 
@@ -176,10 +245,11 @@ Eight thinking-spinner styles, rotated per turn. Pin one with `--anim <name>` or
 | Path | Purpose |
 |---|---|
 | `~/.hakoc/state` | provider, model, api key (mode 0600), session defaults |
-| `<cwd>/.hakoc/state` | per-project session_id, turn count, timestamps |
-| `<cwd>/.hakoc/trust` | sentinel: tools allowed in this cwd |
 | `~/.hakoc/history` | append-only JSONL chat log |
 | `~/.hakoc/skills/*.md` | system-prompt skills (loaded at launch) |
+| `~/.hakoc/input_history` | line editor history (last 500 entries) |
+| `<cwd>/.hakoc/state` | per-project session_id, turn count, timestamps |
+| `<cwd>/.hakoc/trust` | sentinel: tools allowed in this cwd |
 | `~/.hakocrc` | user config (provider, model, mascot_path, anim_style, ...) |
 
 ## Security
@@ -188,12 +258,18 @@ Eight thinking-spinner styles, rotated per turn. Pin one with `--anim <name>` or
 - `write_file` / `run_shell`: gated by trust. With `ai_autowrite=0`, `write_file` stages to `<path>.hakoc-pending` for review.
 - `run_shell` runs under `timeout 10 sh -c` — 10s wall clock cap, no interactive stdin.
 - API keys at `~/.hakoc/state` mode 0600.
+- `--update` refuses to install if the sha256 sidecar is missing or doesn't match.
 
 ## Roadmap
 
-v0.1.x — first standalone release. Hako editor still on v0.1.0; AI extraction next session.
-- v0.2: editor integration (build-time `make AI=0|1`), auto-update from GitHub Releases, pluggable local model backend.
-- v0.3+: hakoAI/koi engine plugin, `/login` OAuth where providers add it.
+- **v0.1.2** (current) — termios line editor, `--update` self-updater, directory skills + `read_skill`, universal2 macOS, Linux arm64, FreeBSD x86_64.
+- **v0.2** — editor integration (build-time `make AI=0|1` in hako), pluggable local model backend.
+- **v0.3+** — hakoAI/koi engine plugin, `/login` OAuth where providers add it.
 
-See `../.claude/claw/PLAN.md` for the full milestone tracker.
+See [CHANGELOG.md](CHANGELOG.md) for details.
 
+## License
+
+GPL-3.0.
+
+<sub><em>— deus sol invictus mithras —</em></sub>

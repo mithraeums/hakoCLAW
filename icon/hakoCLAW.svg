@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- hakoCLAW icon: box (箱) + claw mark.
+       Matches hako's box motif, adds three diagonal scratch marks for "claw". -->
+
+  <!-- background: subtle dark square, rounded -->
+  <rect x="64" y="64" width="896" height="896" rx="160" ry="160" fill="#1e1e1e"/>
+
+  <!-- box outline (hako motif): isometric-ish open crate -->
+  <g stroke="#e0e0e0" stroke-width="32" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- top face -->
+    <path d="M 256 320 L 512 224 L 768 320 L 512 416 Z"/>
+    <!-- left face -->
+    <path d="M 256 320 L 256 720 L 512 816 L 512 416 Z"/>
+    <!-- right face -->
+    <path d="M 768 320 L 768 720 L 512 816 L 512 416 Z"/>
+  </g>
+
+  <!-- claw marks: three parallel diagonal slashes across the box -->
+  <g stroke="#ff5252" stroke-width="44" stroke-linecap="round" fill="none" opacity="0.95">
+    <line x1="320" y1="600" x2="720" y2="280"/>
+    <line x1="380" y1="700" x2="780" y2="380"/>
+    <line x1="440" y1="800" x2="840" y2="480"/>
+  </g>
+</svg>

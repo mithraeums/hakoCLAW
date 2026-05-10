@@ -24,7 +24,8 @@
  */
 
 /*** includes ***/
-#define CLAW_VERSION "0.1.1"
+#define CLAW_VERSION "0.1.2"
+#define CLAW_REPO    "mithraeums/hakoCLAW"
 
 #include <ctype.h>
 #include <errno.h>
@@ -63,6 +64,12 @@
 #include <signal.h>
 #include <dirent.h>
 #include <limits.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#endif
 #endif
 #include <pthread.h>
 
@@ -878,6 +885,74 @@ static void hkLoadHistoryTail(aiData *data, int max_msgs) {
 	free(lines);
 }
 
+/* Append a skill block to (buf,total). Header tags include the skill name + optional root path so the
+   model can call read_skill(skill="<name>", path="<rel>") to pull internal files on demand. */
+static void hkAppendSkillBlock(char **buf, size_t *total, const char *name, const char *root, const char *body, long body_len) {
+	char header[512];
+	int hlen;
+	if (root && *root) {
+		hlen = snprintf(header, sizeof(header),
+			"\n<skill name=\"%s\" root=\"%s\">\n", name, root);
+	} else {
+		hlen = snprintf(header, sizeof(header), "\n<skill name=\"%s\">\n", name);
+	}
+	const char *tail = "\n</skill>\n";
+	int tlen = (int)strlen(tail);
+	*buf = realloc(*buf, *total + hlen + body_len + tlen + 1);
+	memcpy(*buf + *total, header, hlen); *total += hlen;
+	memcpy(*buf + *total, body, body_len); *total += body_len;
+	memcpy(*buf + *total, tail, tlen); *total += tlen;
+}
+
+/* Walk a skill directory listing the .md files (relative paths up to MAX_DEPTH=3). Returns malloc'd string
+   like "agents/CEO.md\nagents/DEV.md\n..." — used so the dispatcher knows what's pullable via read_skill. */
+static char *hkSkillListMd(const char *root) {
+	char *out = malloc(2048);
+	size_t cap = 2048, len = 0;
+	out[0] = '\0';
+
+	typedef struct { char path[512]; int depth; } walkent;
+	walkent stack[64];
+	int sp = 0;
+	snprintf(stack[sp].path, sizeof(stack[sp].path), "%s", root);
+	stack[sp].depth = 0;
+	sp++;
+
+	while (sp > 0) {
+		walkent cur = stack[--sp];
+		DIR *d = opendir(cur.path);
+		if (!d) continue;
+		struct dirent *e;
+		while ((e = readdir(d))) {
+			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+			if (strcmp(e->d_name, ".git") == 0 || strcmp(e->d_name, "node_modules") == 0) continue;
+			char full[1024];
+			snprintf(full, sizeof(full), "%s/%s", cur.path, e->d_name);
+			struct stat st;
+			if (stat(full, &st) != 0) continue;
+			if (S_ISDIR(st.st_mode)) {
+				if (cur.depth + 1 < 4 && sp < (int)(sizeof(stack)/sizeof(stack[0]))) {
+					snprintf(stack[sp].path, sizeof(stack[sp].path), "%s", full);
+					stack[sp].depth = cur.depth + 1;
+					sp++;
+				}
+				continue;
+			}
+			int nlen = (int)strlen(e->d_name);
+			if (nlen < 4 || strcmp(e->d_name + nlen - 3, ".md") != 0) continue;
+			const char *rel = full + strlen(root);
+			while (*rel == '/') rel++;
+			int rlen = (int)strlen(rel);
+			if (len + rlen + 2 >= cap) { cap = (cap + rlen + 64) * 2; out = realloc(out, cap); }
+			memcpy(out + len, rel, rlen); len += rlen;
+			out[len++] = '\n';
+			out[len] = '\0';
+		}
+		closedir(d);
+	}
+	return out;
+}
+
 static int hkLoadSkills(aiData *data) {
 	if (!data) return 0;
 	char dir[512];
@@ -894,25 +969,58 @@ static int hkLoadSkills(aiData *data) {
 	struct dirent *e;
 	while ((e = readdir(d))) {
 		if (e->d_name[0] == '.') continue;
-		int nlen = strlen(e->d_name);
-		if (nlen < 4 || strcmp(e->d_name + nlen - 3, ".md") != 0) continue;
 		char path[1024];
 		snprintf(path, sizeof(path), "%s/%s", skills, e->d_name);
+		struct stat st;
+		if (stat(path, &st) != 0) continue;
+
+		if (S_ISDIR(st.st_mode)) {
+			/* Directory skill — look for SKILL.md (or <name>.md) as dispatcher. */
+			char dispatcher[1024] = {0};
+			char cand[1024];
+			snprintf(cand, sizeof(cand), "%s/SKILL.md", path);
+			if (access(cand, R_OK) == 0) snprintf(dispatcher, sizeof(dispatcher), "%s", cand);
+			else {
+				snprintf(cand, sizeof(cand), "%s/%s.md", path, e->d_name);
+				if (access(cand, R_OK) == 0) snprintf(dispatcher, sizeof(dispatcher), "%s", cand);
+			}
+			if (!dispatcher[0]) continue;
+
+			char *body = hkReadFileAll(dispatcher, 200000);
+			if (!body) continue;
+
+			/* Append manifest of inner .md files so the model knows what's loadable via read_skill. */
+			char *manifest = hkSkillListMd(path);
+			size_t blen = strlen(body);
+			size_t mlen = manifest ? strlen(manifest) : 0;
+			char *combined = malloc(blen + mlen + 256);
+			int n = 0;
+			memcpy(combined + n, body, blen); n += blen;
+			n += snprintf(combined + n, 256, "\n\n<files>\n%s</files>\n", manifest ? manifest : "");
+			combined[n] = '\0';
+			free(body);
+			free(manifest);
+
+			hkAppendSkillBlock(&buf, &total, e->d_name, path, combined, n);
+			free(combined);
+			loaded++;
+			continue;
+		}
+
+		int nlen = (int)strlen(e->d_name);
+		if (nlen < 4 || strcmp(e->d_name + nlen - 3, ".md") != 0) continue;
 		FILE *fp = fopen(path, "r");
 		if (!fp) continue;
 		fseek(fp, 0, SEEK_END);
 		long sz = ftell(fp);
 		fseek(fp, 0, SEEK_SET);
 		if (sz < 0 || sz > 200000) { fclose(fp); continue; }
-		char header[256];
-		int hlen = snprintf(header, sizeof(header), "\n<skill name=\"%s\">\n", e->d_name);
-		const char *tail = "\n</skill>\n";
-		int tlen = strlen(tail);
-		buf = realloc(buf, total + hlen + sz + tlen + 1);
-		memcpy(buf + total, header, hlen); total += hlen;
-		fread(buf + total, 1, sz, fp); total += sz;
-		memcpy(buf + total, tail, tlen); total += tlen;
+		char *body = malloc(sz);
+		if (!body) { fclose(fp); continue; }
+		fread(body, 1, sz, fp);
 		fclose(fp);
+		hkAppendSkillBlock(&buf, &total, e->d_name, NULL, body, sz);
+		free(body);
 		loaded++;
 	}
 	closedir(d);
@@ -1080,6 +1188,10 @@ static const hkToolDef HK_TOOLS[] = {
 	 "Run a non-interactive shell command. 10s timeout. Requires project trust.",
 	 "\"cmd\":{\"type\":\"string\"}",
 	 "\"cmd\""},
+	{"read_skill",
+	 "Read a file from inside an installed skill. Use the <skill> blocks plus their <files> manifest in the system prompt to know what is available. Pass skill (the folder name) and path (relative to skill root, no .. or absolute paths). No trust gate; skills are user-installed.",
+	 "\"skill\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}",
+	 "\"skill\",\"path\""},
 };
 static const int HK_TOOL_COUNT = sizeof(HK_TOOLS) / sizeof(HK_TOOLS[0]);
 
@@ -1147,6 +1259,48 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		char *c = hkRunShellCapture(shcmd, 50000);
 		free(shcmd);
 		return c;
+	}
+	if (strcmp(name, "read_skill") == 0) {
+		char *skill = hkExtractJsonString(input_json, "skill");
+		char *path  = hkExtractJsonString(input_json, "path");
+		if (!skill || !path) {
+			free(skill); free(path);
+			return strdup("error: missing skill or path");
+		}
+		/* No / .. in skill name. */
+		if (strchr(skill, '/') || strstr(skill, "..")) {
+			free(skill); free(path);
+			return strdup("error: invalid skill name");
+		}
+		/* No .. or absolute in path. */
+		if (path[0] == '/' || strstr(path, "..")) {
+			free(skill); free(path);
+			return strdup("error: invalid path (must be relative, no ..)");
+		}
+		char dir[512]; hkClawDirPath(dir, sizeof(dir));
+		char skill_root[1024];
+		snprintf(skill_root, sizeof(skill_root), "%s/skills/%s", dir, skill);
+		char full[PATH_MAX];
+		snprintf(full, sizeof(full), "%s/%s", skill_root, path);
+		/* Resolve and verify it stays under skill_root. */
+		char real_root[PATH_MAX], real_full[PATH_MAX];
+		if (!realpath(skill_root, real_root)) {
+			free(skill); free(path);
+			return strdup("error: skill not installed");
+		}
+		if (!realpath(full, real_full)) {
+			free(skill); free(path);
+			return strdup("error: file not found in skill");
+		}
+		size_t rlen = strlen(real_root);
+		if (strncmp(real_full, real_root, rlen) != 0 ||
+			(real_full[rlen] != '/' && real_full[rlen] != '\0')) {
+			free(skill); free(path);
+			return strdup("error: path escapes skill root");
+		}
+		free(skill); free(path);
+		char *c = hkReadFileAll(real_full, 200000);
+		return c ? c : strdup("error: cannot read");
 	}
 	if (strcmp(name, "write_file") == 0) {
 		if (!hkProjectTrusted()) return strdup("error: project not trusted");
@@ -2366,6 +2520,616 @@ static void clSigint(int sig) {
 	E.interrupt = 1;
 }
 
+/*** termios raw line editor ***/
+#ifndef _WIN32
+static struct termios cl_orig_termios;
+static int cl_raw_active = 0;
+
+static int clEnableRaw(void) {
+	if (!isatty(STDIN_FILENO)) return -1;
+	if (tcgetattr(STDIN_FILENO, &cl_orig_termios) == -1) return -1;
+	struct termios raw = cl_orig_termios;
+	raw.c_lflag &= ~(ECHO | ICANON | IEXTEN);
+	raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
+	raw.c_oflag &= ~(OPOST);
+	raw.c_cflag |= (CS8);
+	raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+	if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) return -1;
+	cl_raw_active = 1;
+	if (write(STDOUT_FILENO, "\x1b[?2004h", 8) < 0) {}   /* enable bracketed paste */
+	return 0;
+}
+
+static void clDisableRaw(void) {
+	if (cl_raw_active) {
+		if (write(STDOUT_FILENO, "\x1b[?2004l", 8) < 0) {} /* disable bracketed paste */
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &cl_orig_termios);
+		cl_raw_active = 0;
+	}
+}
+#else
+static int clEnableRaw(void) { return -1; }
+static void clDisableRaw(void) { }
+#endif
+
+#define CL_INPUT_HIST_MAX 500
+static char *cl_in_hist[CL_INPUT_HIST_MAX];
+static int cl_in_hist_n = 0;
+static int cl_in_hist_loaded = 0;
+
+static void clInputHistPath(char *out, size_t cap) {
+	const char *home = getenv("HOME");
+	if (!home) home = ".";
+	snprintf(out, cap, "%s/.hakoc/input_history", home);
+}
+
+static void clInputHistLoad(void) {
+	if (cl_in_hist_loaded) return;
+	cl_in_hist_loaded = 1;
+	char p[512];
+	clInputHistPath(p, sizeof(p));
+	FILE *fp = fopen(p, "r");
+	if (!fp) return;
+	char *line = NULL; size_t cap = 0;
+	while (getline(&line, &cap, fp) != -1) {
+		size_t n = strlen(line);
+		if (n && line[n-1] == '\n') line[--n] = '\0';
+		if (!n) continue;
+		if (cl_in_hist_n >= CL_INPUT_HIST_MAX) {
+			free(cl_in_hist[0]);
+			memmove(&cl_in_hist[0], &cl_in_hist[1], sizeof(cl_in_hist[0])*(CL_INPUT_HIST_MAX-1));
+			cl_in_hist_n--;
+		}
+		cl_in_hist[cl_in_hist_n++] = strdup(line);
+	}
+	free(line);
+	fclose(fp);
+}
+
+static void clInputHistAppend(const char *s) {
+	if (!s || !*s) return;
+	if (cl_in_hist_n > 0 && strcmp(cl_in_hist[cl_in_hist_n-1], s) == 0) return;
+	if (cl_in_hist_n >= CL_INPUT_HIST_MAX) {
+		free(cl_in_hist[0]);
+		memmove(&cl_in_hist[0], &cl_in_hist[1], sizeof(cl_in_hist[0])*(CL_INPUT_HIST_MAX-1));
+		cl_in_hist_n--;
+	}
+	cl_in_hist[cl_in_hist_n++] = strdup(s);
+
+	char p[512]; clInputHistPath(p, sizeof(p));
+	char dir[512]; snprintf(dir, sizeof(dir), "%s", p);
+	char *slash = strrchr(dir, '/'); if (slash) *slash = '\0';
+#ifdef _WIN32
+	_mkdir(dir);
+#else
+	mkdir(dir, 0700);
+#endif
+	FILE *fp = fopen(p, "a");
+	if (fp) { fprintf(fp, "%s\n", s); fclose(fp); }
+}
+
+static int clVisibleLen(const char *s) {
+	int n = 0;
+	for (const char *p = s; *p; p++) {
+		if (*p == '\x1b' && *(p+1) == '[') {
+			while (*p && *p != 'm') p++;
+			if (!*p) break;
+		} else {
+			n++;
+		}
+	}
+	return n;
+}
+
+static int clTermCols(void) {
+#ifndef _WIN32
+	struct winsize ws;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != -1 && ws.ws_col > 0) return ws.ws_col;
+#endif
+	return 80;
+}
+
+/* Multi-row aware redraw (linenoise-style). Tracks rows used + cursor row across calls. */
+static int cl_redraw_oldrows = 0;
+static int cl_redraw_oldrpos = 0;
+
+static void clRedrawReset(void) { cl_redraw_oldrows = 0; cl_redraw_oldrpos = 0; }
+
+static void clAppend(char *ab, int *n, int cap, const char *s, int slen) {
+	if (*n + slen >= cap) return;
+	memcpy(ab + *n, s, slen);
+	*n += slen;
+}
+
+static void clRedrawLine(const char *prompt, const char *buf, int len, int cursor) {
+	int plen = clVisibleLen(prompt);
+	int cols = clTermCols();
+	if (cols < 1) cols = 80;
+
+	int rows = (plen + len + cols - 1) / cols;
+	if (rows < 1) rows = 1;
+
+	char ab[16384];
+	int n = 0;
+	char tmp[64];
+	int t;
+
+	clAppend(ab, &n, sizeof(ab), "\x1b[?25l", 6);   /* hide cursor while redrawing */
+
+	/* From wherever cursor sits (we tracked old cursor row), drop to last row of prior edit area, then walk up
+	   clearing each row. */
+	int below = cl_redraw_oldrows ? (cl_redraw_oldrows - 1 - cl_redraw_oldrpos) : 0;
+	if (below > 0) {
+		t = snprintf(tmp, sizeof(tmp), "\x1b[%dB", below);
+		clAppend(ab, &n, sizeof(ab), tmp, t);
+	}
+	int j;
+	int upclears = cl_redraw_oldrows ? cl_redraw_oldrows - 1 : 0;
+	for (j = 0; j < upclears; j++) {
+		clAppend(ab, &n, sizeof(ab), "\r\x1b[0K\x1b[1A", 10);
+	}
+	clAppend(ab, &n, sizeof(ab), "\r\x1b[0K", 5);
+
+	/* Emit prompt + buffer. */
+	clAppend(ab, &n, sizeof(ab), prompt, (int)strlen(prompt));
+	clAppend(ab, &n, sizeof(ab), buf, len);
+
+	/* If cursor at end and content lands exactly at a column-edge, emit \n\r so terminal scrolls a fresh row. */
+	int rows_after = rows;
+	if (cursor == len && len > 0 && (plen + len) % cols == 0) {
+		clAppend(ab, &n, sizeof(ab), "\n\r", 2);
+		rows_after++;
+	}
+
+	/* Position cursor. */
+	int rpos2 = (plen + cursor) / cols;
+	int up    = (rows_after - 1) - rpos2;
+	if (up > 0) {
+		t = snprintf(tmp, sizeof(tmp), "\x1b[%dA", up);
+		clAppend(ab, &n, sizeof(ab), tmp, t);
+	}
+	int col = (plen + cursor) % cols;
+	clAppend(ab, &n, sizeof(ab), "\r", 1);
+	if (col > 0) {
+		t = snprintf(tmp, sizeof(tmp), "\x1b[%dC", col);
+		clAppend(ab, &n, sizeof(ab), tmp, t);
+	}
+
+	clAppend(ab, &n, sizeof(ab), "\x1b[?25h", 6);   /* show cursor */
+
+	cl_redraw_oldrows = rows_after;
+	cl_redraw_oldrpos = rpos2;
+
+	if (write(STDOUT_FILENO, ab, n) < 0) return;
+}
+
+/* Returns: >=0 = length of line, -1 = EOF, -2 = SIGINT/cancel (empty line). */
+static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
+	if (clEnableRaw() != 0) {
+		printf("%s", prompt); fflush(stdout);
+		if (!fgets(out, cap, stdin)) return -1;
+		size_t n = strlen(out);
+		if (n && out[n-1] == '\n') out[--n] = '\0';
+		return (int)n;
+	}
+	clInputHistLoad();
+	clRedrawReset();
+
+	char buf[4096];
+	int len = 0, cur = 0;
+	int hist_idx = cl_in_hist_n;
+	char saved[4096]; saved[0] = '\0';
+	int in_paste = 0;
+	buf[0] = '\0';
+
+	clRedrawLine(prompt, buf, len, cur);
+
+	while (1) {
+		char c;
+		ssize_t r = read(STDIN_FILENO, &c, 1);
+		if (r <= 0) {
+			if (r < 0 && errno == EINTR) {
+				clDisableRaw();
+				if (write(STDOUT_FILENO, "\r\n", 2) < 0) {}
+				out[0] = '\0';
+				return -2;
+			}
+			clDisableRaw();
+			return -1;
+		}
+
+		if ((c == '\r' || c == '\n') && !in_paste) {
+			if (write(STDOUT_FILENO, "\r\n", 2) < 0) {}
+			clDisableRaw();
+			buf[len] = '\0';
+			if ((size_t)len < cap) memcpy(out, buf, len + 1);
+			else { memcpy(out, buf, cap - 1); out[cap-1] = '\0'; len = (int)cap - 1; }
+			if (len > 0) clInputHistAppend(out);
+			return len;
+		}
+		if ((c == '\r' || c == '\n') && in_paste) {
+			/* Insert literal newline during paste (rendered as space — claw treats prompts as single-line). */
+			if (len + 1 < (int)sizeof(buf)) {
+				memmove(&buf[cur+1], &buf[cur], len - cur);
+				buf[cur++] = ' ';
+				len++; buf[len] = '\0';
+				clRedrawLine(prompt, buf, len, cur);
+			}
+			continue;
+		}
+
+		if (c == 3) {  /* Ctrl-C */
+			if (write(STDOUT_FILENO, "^C\r\n", 4) < 0) {}
+			clDisableRaw();
+			out[0] = '\0';
+			return -2;
+		}
+		if (c == 4) {  /* Ctrl-D */
+			if (len == 0) {
+				clDisableRaw();
+				if (write(STDOUT_FILENO, "\r\n", 2) < 0) {}
+				return -1;
+			}
+			if (cur < len) {
+				memmove(&buf[cur], &buf[cur+1], len - cur - 1);
+				len--; buf[len] = '\0';
+				clRedrawLine(prompt, buf, len, cur);
+			}
+			continue;
+		}
+		if (c == 1) { cur = 0; clRedrawLine(prompt, buf, len, cur); continue; }
+		if (c == 5) { cur = len; clRedrawLine(prompt, buf, len, cur); continue; }
+		if (c == 11) { len = cur; buf[len] = '\0'; clRedrawLine(prompt, buf, len, cur); continue; }
+		if (c == 21) {
+			memmove(&buf[0], &buf[cur], len - cur);
+			len -= cur; cur = 0; buf[len] = '\0';
+			clRedrawLine(prompt, buf, len, cur); continue;
+		}
+		if (c == 23) {
+			int i = cur;
+			while (i > 0 && buf[i-1] == ' ') i--;
+			while (i > 0 && buf[i-1] != ' ') i--;
+			memmove(&buf[i], &buf[cur], len - cur);
+			len -= (cur - i); cur = i; buf[len] = '\0';
+			clRedrawLine(prompt, buf, len, cur); continue;
+		}
+		if (c == 12) {
+			if (write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7) < 0) {}
+			clRedrawReset();
+			clRedrawLine(prompt, buf, len, cur);
+			continue;
+		}
+		if (c == 18) {
+			/* Ctrl-R reverse-incremental search through input history. */
+			char query[256] = {0};
+			int qlen = 0;
+			int match_idx = cl_in_hist_n - 1;
+			char rprompt[1024];
+			while (1) {
+				const char *match = (match_idx >= 0 && match_idx < cl_in_hist_n) ? cl_in_hist[match_idx] : "";
+				snprintf(rprompt, sizeof(rprompt), "(reverse-i-search)`%s': ", query);
+				clRedrawLine(rprompt, match, (int)strlen(match), (int)strlen(match));
+				char rc;
+				if (read(STDIN_FILENO, &rc, 1) != 1) break;
+				if (rc == '\r' || rc == '\n') {
+					/* Accept match into editor. */
+					if (match && *match) {
+						snprintf(buf, sizeof(buf), "%s", match);
+						len = (int)strlen(buf); cur = len;
+					}
+					break;
+				}
+				if (rc == 27 || rc == 7) { /* Esc / ^G — cancel, keep current buf */
+					break;
+				}
+				if (rc == 18) { /* ^R — find next older match */
+					int start = match_idx - 1;
+					while (start >= 0) {
+						if (qlen == 0 || strstr(cl_in_hist[start], query)) { match_idx = start; break; }
+						start--;
+					}
+					continue;
+				}
+				if (rc == 127 || rc == 8) {
+					if (qlen > 0) { query[--qlen] = '\0'; }
+					/* Restart search from end. */
+					match_idx = cl_in_hist_n - 1;
+					if (qlen > 0) {
+						while (match_idx >= 0 && !strstr(cl_in_hist[match_idx], query)) match_idx--;
+					}
+					continue;
+				}
+				if ((unsigned char)rc < 32) {
+					/* Other control char — exit search, do not deliver (keep simple). */
+					break;
+				}
+				if (qlen + 1 < (int)sizeof(query)) {
+					query[qlen++] = rc; query[qlen] = '\0';
+					/* Search from match_idx downward for substring. */
+					int start = match_idx;
+					while (start >= 0 && !strstr(cl_in_hist[start], query)) start--;
+					if (start >= 0) match_idx = start;
+				}
+			}
+			clRedrawReset();
+			clRedrawLine(prompt, buf, len, cur);
+			continue;
+		}
+		if (c == 127 || c == 8) {
+			if (cur > 0) {
+				memmove(&buf[cur-1], &buf[cur], len - cur);
+				cur--; len--; buf[len] = '\0';
+				clRedrawLine(prompt, buf, len, cur);
+			}
+			continue;
+		}
+
+		if (c == '\x1b') {
+			char s1, s2;
+			if (read(STDIN_FILENO, &s1, 1) != 1) continue;
+			if (s1 != '[' && s1 != 'O') continue;
+			if (read(STDIN_FILENO, &s2, 1) != 1) continue;
+			if (s2 >= '0' && s2 <= '9') {
+				char s3;
+				if (read(STDIN_FILENO, &s3, 1) != 1) continue;
+				/* Bracketed paste: \x1b[200~ ... \x1b[201~ */
+				if (s2 == '2' && s3 == '0') {
+					char s4, s5;
+					if (read(STDIN_FILENO, &s4, 1) != 1) continue;
+					if (read(STDIN_FILENO, &s5, 1) != 1) continue;
+					if (s4 == '0' && s5 == '~') { in_paste = 1; continue; }
+					if (s4 == '1' && s5 == '~') { in_paste = 0; clRedrawLine(prompt, buf, len, cur); continue; }
+					continue;
+				}
+				if (s2 == '3' && s3 == '~') {
+					if (cur < len) {
+						memmove(&buf[cur], &buf[cur+1], len - cur - 1);
+						len--; buf[len] = '\0';
+						clRedrawLine(prompt, buf, len, cur);
+					}
+				} else if ((s2 == '1' || s2 == '7') && s3 == '~') {
+					cur = 0; clRedrawLine(prompt, buf, len, cur);
+				} else if ((s2 == '4' || s2 == '8') && s3 == '~') {
+					cur = len; clRedrawLine(prompt, buf, len, cur);
+				}
+				continue;
+			}
+			switch (s2) {
+				case 'A':
+					if (cl_in_hist_n == 0) break;
+					if (hist_idx == cl_in_hist_n) {
+						strncpy(saved, buf, sizeof(saved)-1); saved[sizeof(saved)-1] = '\0';
+					}
+					if (hist_idx > 0) {
+						hist_idx--;
+						snprintf(buf, sizeof(buf), "%s", cl_in_hist[hist_idx]);
+						len = (int)strlen(buf); cur = len;
+						clRedrawLine(prompt, buf, len, cur);
+					}
+					break;
+				case 'B':
+					if (hist_idx < cl_in_hist_n) {
+						hist_idx++;
+						if (hist_idx == cl_in_hist_n) snprintf(buf, sizeof(buf), "%s", saved);
+						else snprintf(buf, sizeof(buf), "%s", cl_in_hist[hist_idx]);
+						len = (int)strlen(buf); cur = len;
+						clRedrawLine(prompt, buf, len, cur);
+					}
+					break;
+				case 'C': if (cur < len) { cur++; clRedrawLine(prompt, buf, len, cur); } break;
+				case 'D': if (cur > 0) { cur--; clRedrawLine(prompt, buf, len, cur); } break;
+				case 'H': cur = 0; clRedrawLine(prompt, buf, len, cur); break;
+				case 'F': cur = len; clRedrawLine(prompt, buf, len, cur); break;
+			}
+			continue;
+		}
+
+		/* printable + UTF-8 multi-byte: insert at cursor */
+		if ((unsigned char)c >= 32) {
+			if (len + 1 >= (int)sizeof(buf)) continue;
+			memmove(&buf[cur+1], &buf[cur], len - cur);
+			buf[cur] = c;
+			cur++; len++; buf[len] = '\0';
+			clRedrawLine(prompt, buf, len, cur);
+			continue;
+		}
+	}
+}
+
+/*** self-update (Phase 3) ***/
+static int clOwnPath(char *out, size_t cap) {
+#ifdef __APPLE__
+	uint32_t sz = (uint32_t)cap;
+	char tmp[PATH_MAX];
+	if (_NSGetExecutablePath(tmp, &sz) != 0) return -1;
+	if (!realpath(tmp, out)) snprintf(out, cap, "%s", tmp);
+	return 0;
+#elif defined(__linux__)
+	ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+	if (n <= 0) return -1;
+	out[n] = '\0';
+	return 0;
+#elif defined(__FreeBSD__)
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+	size_t sz = cap;
+	if (sysctl(mib, 4, out, &sz, NULL, 0) != 0) return -1;
+	return 0;
+#elif defined(_WIN32)
+	DWORD n = GetModuleFileNameA(NULL, out, (DWORD)cap);
+	return (n == 0 || n == cap) ? -1 : 0;
+#else
+	(void)out; (void)cap;
+	return -1;
+#endif
+}
+
+static const char *clPlatformAsset(void) {
+#if defined(__APPLE__)
+	return "hakoCLAW-macos-universal.tar.gz";
+#elif defined(__linux__)
+  #if defined(__aarch64__) || defined(__arm64__)
+	return "hakoCLAW-linux-arm64.tar.gz";
+  #else
+	return "hakoCLAW-linux-x86_64.tar.gz";
+  #endif
+#elif defined(__FreeBSD__)
+	return "hakoCLAW-freebsd-x86_64.tar.gz";
+#elif defined(_WIN32)
+	return "hakoCLAW-windows-x86_64.zip";
+#else
+	return NULL;
+#endif
+}
+
+static const char *clPlatformDir(void) {
+#if defined(__APPLE__)
+	return "hakoCLAW-macos-universal";
+#elif defined(__linux__)
+  #if defined(__aarch64__) || defined(__arm64__)
+	return "hakoCLAW-linux-arm64";
+  #else
+	return "hakoCLAW-linux-x86_64";
+  #endif
+#elif defined(__FreeBSD__)
+	return "hakoCLAW-freebsd-x86_64";
+#elif defined(_WIN32)
+	return "hakoCLAW-windows-x86_64";
+#else
+	return NULL;
+#endif
+}
+
+static int clCmdUpdate(int force) {
+	const char *asset = clPlatformAsset();
+	const char *pdir  = clPlatformDir();
+	if (!asset || !pdir) {
+		fprintf(stderr, "update: unsupported platform\n");
+		return 1;
+	}
+
+	/* fetch latest tag */
+	char tag[64] = {0};
+	{
+		char cmd[512];
+		snprintf(cmd, sizeof(cmd),
+			"curl -fsSL https://api.github.com/repos/%s/releases/latest 2>/dev/null", CLAW_REPO);
+		FILE *fp = popen(cmd, "r");
+		if (!fp) { fprintf(stderr, "update: curl spawn failed\n"); return 1; }
+		char json[16384]; size_t n = fread(json, 1, sizeof(json)-1, fp); json[n] = '\0';
+		pclose(fp);
+		char *p = strstr(json, "\"tag_name\":\"");
+		if (!p) {
+			fprintf(stderr, "update: could not fetch latest release (network? rate limit?)\n");
+			return 1;
+		}
+		p += 12;
+		char *e = strchr(p, '"');
+		if (!e) { fprintf(stderr, "update: malformed release json\n"); return 1; }
+		int tlen = (int)(e - p);
+		if (tlen >= (int)sizeof(tag)) tlen = sizeof(tag) - 1;
+		memcpy(tag, p, tlen); tag[tlen] = '\0';
+	}
+
+	char cur_tag[64];
+	snprintf(cur_tag, sizeof(cur_tag), "v%s", CLAW_VERSION);
+	printf("latest: %s · current: %s\n", tag, cur_tag);
+	if (!force && strcmp(tag, cur_tag) == 0) {
+		printf("already up to date.\n");
+		return 0;
+	}
+
+	/* tmp dir */
+	char tmp_dir[256];
+	snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/hakoc-update-%ld", (long)time(NULL));
+#ifdef _WIN32
+	_mkdir(tmp_dir);
+#else
+	mkdir(tmp_dir, 0700);
+#endif
+
+	char tmp_archive[512];
+	snprintf(tmp_archive, sizeof(tmp_archive), "%s/%s", tmp_dir, asset);
+
+	char sha_name[128];
+	snprintf(sha_name, sizeof(sha_name), "%s", asset);
+	char *dot = strstr(sha_name, ".tar.gz"); if (!dot) dot = strstr(sha_name, ".zip");
+	if (dot) *dot = '\0';
+	strncat(sha_name, ".sha256", sizeof(sha_name) - strlen(sha_name) - 1);
+
+	char tmp_sha[512];
+	snprintf(tmp_sha, sizeof(tmp_sha), "%s/%s", tmp_dir, sha_name);
+
+	{
+		char cmd[1024];
+		printf("downloading %s ...\n", asset);
+		snprintf(cmd, sizeof(cmd),
+			"curl -fsSL -o '%s' 'https://github.com/%s/releases/download/%s/%s'",
+			tmp_archive, CLAW_REPO, tag, asset);
+		if (system(cmd) != 0) { fprintf(stderr, "update: download failed\n"); return 1; }
+
+		snprintf(cmd, sizeof(cmd),
+			"curl -fsSL -o '%s' 'https://github.com/%s/releases/download/%s/%s'",
+			tmp_sha, CLAW_REPO, tag, sha_name);
+		int sha_ok = (system(cmd) == 0);
+
+		if (sha_ok) {
+			char vcmd[1024];
+#ifdef __APPLE__
+			snprintf(vcmd, sizeof(vcmd),
+				"cd '%s' && tar xzf '%s' && cd '%s' && shasum -a 256 -c '../%s' >/dev/null 2>&1",
+				tmp_dir, asset, pdir, sha_name);
+#else
+			snprintf(vcmd, sizeof(vcmd),
+				"cd '%s' && tar xzf '%s' && cd '%s' && sha256sum -c '../%s' >/dev/null 2>&1",
+				tmp_dir, asset, pdir, sha_name);
+#endif
+			if (system(vcmd) != 0) {
+				fprintf(stderr, "update: sha256 verify FAILED — aborting\n");
+				return 1;
+			}
+			printf("sha256 ok.\n");
+		} else {
+			fprintf(stderr, "update: sha sidecar missing — aborting (use --force-no-verify to override)\n");
+			return 1;
+		}
+	}
+
+	/* find new binary */
+	char new_bin[512];
+#ifdef _WIN32
+	snprintf(new_bin, sizeof(new_bin), "%s/%s/hakoc.exe", tmp_dir, pdir);
+#else
+	snprintf(new_bin, sizeof(new_bin), "%s/%s/hakoc", tmp_dir, pdir);
+#endif
+
+	char self[PATH_MAX];
+	if (clOwnPath(self, sizeof(self)) != 0) {
+		fprintf(stderr, "update: can't resolve own path; new binary at %s\n", new_bin);
+		return 1;
+	}
+
+	if (rename(new_bin, self) != 0) {
+		fprintf(stderr, "update: atomic replace failed (%s)\n", strerror(errno));
+		fprintf(stderr, "  new binary: %s\n", new_bin);
+		fprintf(stderr, "  target:     %s\n", self);
+		fprintf(stderr, "  copy manually with sudo if cross-device or permission denied.\n");
+		return 1;
+	}
+#ifndef _WIN32
+	chmod(self, 0755);
+#endif
+	printf("updated: %s → %s\n", cur_tag, tag);
+
+	char rmcmd[512];
+#ifdef _WIN32
+	snprintf(rmcmd, sizeof(rmcmd), "rmdir /s /q \"%s\"", tmp_dir);
+#else
+	snprintf(rmcmd, sizeof(rmcmd), "rm -rf '%s'", tmp_dir);
+#endif
+	(void)system(rmcmd);
+	return 0;
+}
+
 /*** REPL ***/
 static void clBanner(aiData *data) {
 	clPrintMascot();
@@ -2585,17 +3349,15 @@ static int clRepl(aiData *data) {
 		hkLoadHistoryTail(data, 40);
 	}
 
-	char *line = NULL;
-	size_t cap = 0;
+	char line[4096];
+	const char *prompt_color = "\x1b[1m> \x1b[0m";
+	const char *prompt_plain = "> ";
 
 	while (1) {
-		if (E.color_enabled) printf("%s> %s", ANSI_BOLD, ANSI_RESET);
-		else printf("> ");
-		fflush(stdout);
-
-		ssize_t n = getline(&line, &cap, stdin);
-		if (n < 0) { printf("\n"); break; }
-		if (n > 0 && line[n - 1] == '\n') { line[--n] = '\0'; }
+		const char *prompt = E.color_enabled ? prompt_color : prompt_plain;
+		int n = clReadLineRaw(prompt, line, sizeof(line));
+		if (n == -1) { break; }                    /* EOF */
+		if (n == -2) { E.interrupt = 0; continue; }/* Ctrl-C cancel */
 		if (n == 0) continue;
 
 		if (line[0] == '/') {
@@ -2604,7 +3366,6 @@ static int clRepl(aiData *data) {
 			continue;
 		}
 
-		/* terminal already echoed user input — store only, do not reprint */
 		aiPushHistoryStore(data, line, HK_ROLE_USER);
 		hkLogMessage("user", line);
 		E.session_turn_count++;
@@ -2627,7 +3388,6 @@ static int clRepl(aiData *data) {
 		}
 	}
 
-	free(line);
 	return 0;
 }
 
@@ -2636,6 +3396,8 @@ static void clUsage(void) {
 	printf("hakoCLAW v%s — standalone AI agent CLI\n", CLAW_VERSION);
 	printf("usage: hakoc [options]\n");
 	printf("  -p <prompt>     one-shot prompt, exit when done\n");
+	printf("  --update        check GitHub for latest release, replace self if newer\n");
+	printf("  --update-force  re-download latest even if same version\n");
 	printf("  --mascot <path> load custom ASCII mascot from file\n");
 	printf("  --anim <name>   pin animation: braille|dots|bar|pulse|bounce|ghost|arrows|blocks\n");
 	printf("  --no-color      disable ANSI color/animation\n");
@@ -2660,6 +3422,8 @@ int main(int argc, char **argv) {
 		if (strcmp(a, "-v") == 0 || strcmp(a, "--version") == 0) {
 			printf("hakoCLAW v%s\n", CLAW_VERSION); return 0;
 		}
+		if (strcmp(a, "--update") == 0)       { return clCmdUpdate(0); }
+		if (strcmp(a, "--update-force") == 0) { return clCmdUpdate(1); }
 		if (strcmp(a, "-p") == 0) {
 			if (i + 1 >= argc) { fprintf(stderr, "-p needs argument\n"); return 2; }
 			one_shot = argv[++i]; continue;
