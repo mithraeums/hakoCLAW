@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hakoCLAW/releases"><img src="https://img.shields.io/badge/version-v0.1.2-b89656?style=flat-square&labelColor=14130f" alt="v0.1.2"/></a>
+  <a href="https://github.com/mithraeums/hakoCLAW/releases"><img src="https://img.shields.io/badge/version-v0.1.3-b89656?style=flat-square&labelColor=14130f" alt="v0.1.3"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13%2B-c8c2b2?style=flat-square&labelColor=14130f" alt="13+ providers"/>
@@ -17,21 +17,55 @@
 </p>
 
 <p align="center">
-  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hakoCLAW/releases">releases</a> &nbsp;·&nbsp; <a href="CHANGELOG.md">changelog</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
+  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hakoCLAW/releases">releases</a> &nbsp;·&nbsp; <a href="CHANGELOG.md">changelog</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako">hako</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
 </p>
 
 <br>
 
 ```
-  ▄█████▄    hakoCLAW v0.1.2
- ██ ███ ██   provider: gemini
- █████████   model: gemini-2.5-flash
- ▀█▀▀█▀▀█▀   trust: granted
+    █       █     hakoCLAW v0.1.3
+   ███     ███    provider: gemini
+ ███████████████  model: gemini-2.5-flash
+ ███░████████░██  trust: granted
+ ███████████████
+ ███████████████
 ```
+<table>
+  <tr>
+    <td width="33%" valign="top"><b>Local first.</b><br/><sub>Your text, your keys, your weights. No telemetry. No silent network. The cursor is a private place.</sub></td>
+    <td width="33%" valign="top"><b>Single binary.</b><br/><sub>One C file. Builds with <code>gcc -lpthread</code>. Curl on PATH for HTTP. Nothing else linked.</sub></td>
+    <td width="33%" valign="top"><b>Bring your own deity.</b><br/><sub>Anthropic, OpenAI, Gemini, Groq, Cerebras, Ollama, plus 7 more. Set a key, set a model, that's the wire.</sub></td>
+  </tr>
+</table>
 
 <p align="center"><sub><b>—— I ——</b></sub></p>
 
-## Install
+## Overview
+
+- **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
+- **13 providers, 3 wire formats.** Anthropic native (SSE), OpenAI function-calling, Ollama local. Aliases route Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, OpenRouter, xAI/Grok, custom over OpenAI-compat. `koi` slot reserved for [hakoAI](https://github.com/mithraeums/hakoAI).
+- **Trust-gated tools.** `read_file`, `list_dir`, `write_file` (with staging), `run_shell` (10s timeout). Untrusted dir = all tools refused. `/trust` once per project.
+- **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
+- **Self-update.** `hakoc --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
+- **Streaming + spinners.** Anthropic SSE streams live tokens. 8 spinner styles × 12 thinking labels rotate per turn (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`).
+
+<p align="center"><sub><b>—— II ——</b></sub></p>
+
+## Build & Run
+
+### Build
+
+```sh
+gcc hakoCLAW.c -o hakoc -lpthread        # one-liner
+
+make                                      # cross-OS Makefile
+make UNIVERSAL=1                          # macOS arm64 + x86_64 fat binary
+make asan                                 # ASan + UBSan build
+```
+
+> Deps: libc + pthread + `curl(1)` on PATH. No third-party libraries linked.
+
+### Install
 
 ```sh
 curl -fsSL https://mithraeums.github.io/install.sh | sh
@@ -49,9 +83,7 @@ Detects OS and arch, downloads the latest signed release, verifies the sha256 si
   </tr>
 </table>
 
-<p align="center"><sub><b>—— II ——</b></sub></p>
-
-## First turn
+### First turn
 
 ```sh
 hakoc                    # interactive REPL
@@ -74,63 +106,41 @@ hakoc --update           # check + atomic-replace if newer
 
 <p align="center"><sub><b>—— III ——</b></sub></p>
 
-## Creed
+## Key Bindings & Commands
 
-<table>
-  <tr>
-    <td width="33%" valign="top"><b>Local first.</b><br/><sub>Your text, your keys, your weights. No telemetry. No silent network. The cursor is a private place.</sub></td>
-    <td width="33%" valign="top"><b>Single binary.</b><br/><sub>One C file. Builds with <code>gcc -lpthread</code>. Curl on PATH for HTTP. Nothing else linked.</sub></td>
-    <td width="33%" valign="top"><b>Bring your own deity.</b><br/><sub>Anthropic, OpenAI, Gemini, Groq, Cerebras, Ollama, plus 7 more. Set a key, set a model, that's the wire.</sub></td>
-  </tr>
-</table>
+### Normal Mode
+
+| Key | Action |
+|---|---|
+| ← → | move cursor |
+| ↑ ↓ | history prev / next |
+| Home / End · `^A` / `^E` | line start / end |
+| `^U` / `^K` / `^W` | kill to start / end / word |
+| `^R` | reverse-incremental history search |
+| `^L` | clear screen |
+| Backspace · Delete | delete back / forward at cursor |
+| `^C` | cancel current line |
+| `^D` (empty) | EOF / exit |
+
+*Bracketed paste enabled in raw mode — multi-line pastes batch-insert.*
+
+### Slash commands (inside prompt):
+
+```
+/help            /clear
+/login [<prov>]  /provider <name>   /model <id>      /models
+/history [local|global]
+/skills [reload]    /skill install <url>    /skill uninstall <name>
+/tools on|off       /trust [revoke]         /usage
+/sessions           /resume <id>            /session [new]
+/quit
+```
 
 <p align="center"><sub><b>—— IV ——</b></sub></p>
 
-## What you get
+## Configuration
 
-- **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
-- **13+ providers.** Anthropic native (SSE), OpenAI function-calling, Ollama local. Aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, OpenRouter, xAI, Grok, custom. `koi` slot reserved for [hakoAI](https://github.com/mithraeums/hakoAI).
-- **Trust-gated tools.** `read_file`, `list_dir`, `write_file` (with staging), `run_shell` (10s timeout). Untrusted dir = all tools refused. `/trust` once per project.
-- **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
-- **Self-update.** `hakoc --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
-- **Streaming + spinners.** Anthropic SSE streams live tokens. 8 spinner styles × 12 thinking labels rotate per turn (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`).
-
-<p align="center"><sub><b>—— V ——</b></sub></p>
-
-## Build
-
-```sh
-gcc hakoCLAW.c -o hakoc -lpthread        # one-liner
-
-make                                      # cross-OS Makefile
-make UNIVERSAL=1                          # macOS arm64 + x86_64 fat binary
-make asan                                 # ASan + UBSan build
-```
-
-> Deps: libc + pthread + `curl(1)` on PATH. No third-party libraries linked.
-
-<p align="center"><sub><b>—— VI ——</b></sub></p>
-
-## Providers
-
-| Provider | id | Free? | Native? |
-|---|---|---|---|
-| Anthropic | `anthropic` / `claude` | — | yes (SSE) |
-| OpenAI | `openai` / `gpt` | — | function-calling |
-| Ollama (local) | `ollama` / `local` | ∞ | yes |
-| Gemini | `gemini` / `google` | ✓ generous | OpenAI-compat |
-| Groq | `groq` | ✓ fastest | OpenAI-compat |
-| Cerebras | `cerebras` | ✓ | OpenAI-compat |
-| OpenRouter | `openrouter` | `:free` models | OpenAI-compat |
-| Mistral | `mistral` | rate-limited | OpenAI-compat |
-| DeepSeek · Together · Fireworks · xAI · Grok · custom | varies | — | OpenAI-compat |
-
-Quickest path with no card: `hakoc` → `/login gemini` → `/model gemini-2.5-flash`.
-Does **not** bypass paid subscriptions (Claude Pro, ChatGPT Plus) — those are first-party-client-only.
-
-<p align="center"><sub><b>—— VII ——</b></sub></p>
-
-## Auth · Trust · State
+### Auth · Trust · State
 
 ```
 ~/.hakoc/state              provider, model, api key (mode 0600)
@@ -146,25 +156,27 @@ Keys are read in this order: `CLAW_API_KEY` env → `<PROVIDER>_API_KEY` env →
 
 First run in any directory asks for trust. Untrusted = no tool access at all.
 
-<p align="center"><sub><b>—— VIII ——</b></sub></p>
+### Provider/Model
 
-## Line editor
+| Provider       | id (`/provider <id>`)    | Free tier      | Wire format       |
+|---             |---                       |---             |---                |
+| Anthropic      | `anthropic` · `claude`   | —              | native + SSE      |
+| OpenAI         | `openai` · `gpt`         | —              | function-calling  |
+| Ollama (local) | `ollama` · `local`       | ∞              | native            |
+| Gemini         | `gemini` · `google`      | ✓ generous     | OpenAI-compat     |
+| Groq           | `groq`                   | ✓ fastest      | OpenAI-compat     |
+| Cerebras       | `cerebras`               | ✓              | OpenAI-compat     |
+| OpenRouter     | `openrouter`             | `:free` models | OpenAI-compat     |
+| Mistral        | `mistral`                | rate-limited   | OpenAI-compat     |
+| DeepSeek       | `deepseek`               | —              | OpenAI-compat     |
+| Together       | `together`               | —              | OpenAI-compat     |
+| Fireworks      | `fireworks`              | —              | OpenAI-compat     |
+| xAI            | `xai` · `grok`           | —              | OpenAI-compat     |
+| custom         | `custom`                 | depends        | OpenAI-compat     |
 
-| Key | Action |
-|---|---|
-| ← → | move cursor |
-| ↑ ↓ | history prev / next |
-| Home / End · `^A` / `^E` | line start / end |
-| `^U` / `^K` / `^W` | kill to start / end / word |
-| `^R` | reverse-incremental history search |
-| `^L` | clear screen |
-| Backspace · Delete | delete back / forward at cursor |
-| `^C` | cancel current line |
-| `^D` (empty) | EOF / exit |
+*13 provider names; 3 wire formats (Anthropic, Ollama, OpenAI-compat). Quickest path with no card: `hakoc` → `/login gemini` → `/model gemini-2.5-flash`. Does **not** bypass paid subscriptions (Claude Pro, ChatGPT Plus) — those are first-party-client-only.*
 
-Bracketed paste enabled in raw mode — multi-line pastes batch-insert.
-
-<p align="center"><sub><b>—— IX ——</b></sub></p>
+<p align="center"><sub><b>—— V ——</b></sub></p>
 
 ## Skills
 
@@ -190,27 +202,44 @@ hakoc        # "loaded 1 skill(s)"
 
 Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
-<p align="center"><sub><b>—— X ——</b></sub></p>
+<p align="center"><sub><b>—— VI ——</b></sub></p>
 
-## Slash commands
+## Change Log
 
-```
-/help            /clear
-/login [<prov>]  /provider <name>   /model <id>
-/history [local|global]
-/skills [reload]    /skill install <url>    /skill uninstall <name>
-/tools on|off       /trust [revoke]         /usage
-/sessions           /resume <id>            /session [new]
-/quit
-```
+### v0.1.3 (Latest)<br>
+- **Framed Banner** with `# NEW`/`# TIPS`
+- **Fixed tool-calls** `/models` for ollama, Gemini
+- **Windows byte-exact** read/write
+- **Marked directories** via `list_dir`
+
+See [CHANGELOG.md](CHANGELOG.md) for full history.
+
+<p align="center"><sub><b>—— VII ——</b></sub></p>
 
 ## Roadmap
 
-- **v0.1.2** (current) — termios line editor, `--update`, directory skills + `read_skill`, universal2, Linux arm64, FreeBSD x86_64.
-- **v0.2** — editor integration in [hako](https://github.com/mithraeums/hako) (build-time `make AI=0|1`), pluggable local model backend.
-- **v0.3+** — [hakoAI](https://github.com/mithraeums/hakoAI)/`koi` engine plugin, OAuth where providers add it.
+- [ ] Termios line editor
+- [ ] `--update`
+- [ ] directory skills + `read_skill`
+- [ ] universal2, Linux arm64, FreeBSD x86_64
+- [ ] editor integration in [hako](https://github.com/mithraeums/hako) (build-time `make AI=0|1`), pluggable local model backend.
+- [ ] [hakoAI](https://github.com/mithraeums/hakoAI)/`koi` engine plugin, OAuth where providers add it
 
-See [CHANGELOG.md](CHANGELOG.md) for full history.
+<p align="center"><sub><b>—— VIII ——</b></sub></p>
+
+## Contributing
+If you share the belief that simplicity empowers creativity, feel free to contribute.
+
+### Contribution is welcome in the form of:
+- Forking this repo
+- Submitting a Pull Request
+- Bug reports and feature requests
+
+Please ensure your code follows the existing style.
+
+### Thank you for your attention.
+This project started out of curiosity and as a branch of [hako](https://github.com/mithraeums/hako), a C based modal text editor. If you hit any issues, feel free to open an issue on GitHub.
+Pull requests, suggestions, or even thoughtful discussions are welcome.
 
 <p align="center"><sub><a href="LICENSE">— SEE LICENSE —</a> &nbsp;·&nbsp; GPL-3.0</sub></p>
 

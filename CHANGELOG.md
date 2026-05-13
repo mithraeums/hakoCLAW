@@ -3,7 +3,27 @@
 All notable changes to hakoCLAW. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
-## [v0.1.2] — 2026-05-10
+## [v0.1.3]
+
+### Added
+- **Framed banner** — boxed startup with HAKO + CLAW figlet on the right, mascot on the left, inline `# NEW` and `# TIPS` sections. Auto-tiers LARGER / SMALLER / compact by terminal rows × cols. `--compact` forces one-liner.
+- **`/models` slash** — lists installed Ollama models via `<endpoint>/api/tags`. 3s timeout; clear hint when daemon unreachable.
+- **Terminal title brand** — sets `爪 hakoCLAW` via OSC 0 on REPL entry, cleared on exit. Skipped in one-shot mode.
+
+### Fixed
+- **Gemini `INVALID_ARGUMENT` on tool turns.** Root cause: OpenAI/Gemini-compat tool flow dropped `tool_calls` from the assistant message and omitted `tool_call_id` on each tool reply. Strict validators 400-reject. `hkFnToolExecAll` now preserves both; added `aiPushMessageBody` (raw=2 message serializer) + `hkExtractRawJsonArray` helper.
+- **Ollama empty-response after provider swap.** `hkApplyProviderAlias` was guarded by `if (!E.ai_endpoint)` — switching gemini→ollama left endpoint at `generativelanguage.googleapis.com`, so requests POSTed to Google. Now always swaps endpoint on switch. Added `http://localhost:11434` default for `ollama` / `local` / `koi`.
+- **Windows / cross-platform read/write** — `hkReadFileAll`, `write_file` staging + commit, `hkSaveSession` reads use `"rb"` / `"wb"` for byte-exact round-trips (no CRLF stripping on Windows).
+- **`list_dir`** marks directories with a `/` suffix so the model can tell them apart without a stat follow-up.
+
+### Hardened
+- **iSh skill loader:** bounded `fread` (terminate at `got`, not `sz`), checked `realloc` (no leak on failure), 4 MiB cumulative skill-prompt cap.
+
+### Icons
+- New mithraeum-aesthetic SVG (`icon/hakoCLAW.svg`): kanji `爪` on void with gold corner ticks, dashed spring accent, rust claw scratches, ordo footer.
+- `make icons` target regenerates `.icns` / `.ico` / `.png` / iconset from the SVG. Falls back to Python PIL for `.ico` when ImageMagick missing.
+
+## [v0.1.2]
 
 ### Added
 - **Termios raw line editor.** Cursor keys (← → Home End), readline-style chords (^A ^E ^U ^K ^W ^L), backspace/delete at cursor, ^C cancel, ^D EOF on empty.
@@ -27,7 +47,7 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 ### Fixed
 - Cursor stuck at right edge / garbage chars when typing past terminal width.
 
-## [v0.1.1] — 2026-05-08
+## [v0.1.1]
 
 ### Added
 - **`/login <provider>`** — opens browser to provider console, hides paste, persists key to `~/.hakoc/state` mode 0600.
@@ -48,7 +68,7 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - Duplicate user echo in REPL (terminal echoes input already; store-only path used).
 - Empty-response error includes first 180 bytes of raw response for diagnosis.
 
-## [v0.1.0] — 2026-05-08
+## [v0.1.0]
 
 ### Added
 - Initial standalone release. Lifted entire AI subsystem from `hako.c` (~2340 LOC).

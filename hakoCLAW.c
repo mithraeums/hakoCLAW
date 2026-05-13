@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define CLAW_VERSION "0.1.2"
+#define CLAW_VERSION "0.1.3"
 #define CLAW_REPO    "mithraeums/hakoCLAW"
 
 #include <ctype.h>
@@ -219,6 +219,7 @@ struct clConfig {
 	char *mascot_path;
 	int anim_force_style;  /* -1 = rotate, 0..N = pin */
 	int debug;
+	int compact;           /* --compact: skip figlet + framed box on banner */
 };
 
 struct clConfig E;
@@ -271,11 +272,58 @@ static const char *CL_LABELS[] = {
 static const int CL_LABEL_COUNT = sizeof(CL_LABELS) / sizeof(CL_LABELS[0]);
 
 /*** default mascot (4-line ghost, lifted from hako) ***/
+/* Figlet split into HAKO (top half) + CLAW (bottom half) so they stack on the
+   right side of the framed banner. ~32 cells wide each, 6 rows. */
+static const char *CL_FIGLET_HAKO[] = {
+	"██╗  ██╗ █████╗ ██╗  ██╗ ██████╗",
+	"██║  ██║██╔══██╗██║ ██╔╝██╔═══██╗",
+	"███████║███████║█████╔╝ ██║   ██║",
+	"██╔══██║██╔══██║██╔═██╗ ██║   ██║",
+	"██║  ██║██║  ██║██║  ██╗╚██████╔╝",
+	"╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝",
+	NULL
+};
+static const char *CL_FIGLET_CLAW[] = {
+	" ██████╗██╗      █████╗ ██╗    ██╗",
+	"██╔════╝██║     ██╔══██╗██║    ██║",
+	"██║     ██║     ███████║██║ █╗ ██║",
+	"██║     ██║     ██╔══██║██║███╗██║",
+	"╚██████╗███████╗██║  ██║╚███╔███╔╝",
+	" ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝",
+	NULL
+};
+
+/* Version-pinned. Update on every CLAW_VERSION bump. Top 2-3 shown under # NEW.
+   Keep each line <= 56 chars so it fits inside the 62-wide banner box. */
+static const char *CL_NEW[] = {
+	"gemini tool-calls fixed (id + call array preserved)",
+	"/models lists installed ollama models",
+	"ollama endpoint-leak on provider swap fixed",
+	NULL
+};
+
+/* Static tip pool. Rotated by date so same session shows the same pair,
+   but day-over-day surfaces fresh ones. Keep <= 56 chars. */
+static const char *CL_TIPS[] = {
+	"/trust unlocks file ops in this directory",
+	"/provider + /login swap providers fast",
+	"/models lists local ollama models",
+	"/sessions, /resume <id> revisit past chats",
+	"/usage prints token totals + cap + log path",
+	"-p \"prompt\" runs one-shot (good for pipes)",
+	"--anim pins spinner; --mascot swaps the ghost",
+	"CLAW_API_KEY in env overrides provider keys",
+	"skills loaded from ~/.hakoc/skills/*.md",
+	NULL
+};
+
 static const char *CL_DEFAULT_MASCOT[] = {
-	"  ▄█████▄ ",
-	" ██ ███ ██",
-	" █████████",
-	" ▀█▀▀█▀▀█▀",
+	"   █       █   ",
+	"  ███     ███  ",
+	"███████████████",
+	"███░████████░██",
+	"███████████████",
+	"███████████████",
 	NULL
 };
 
@@ -284,6 +332,7 @@ static void aiAddHistory(aiData *data, const char *text);
 static void aiAddHistoryRole(aiData *data, const char *text, unsigned char role);
 static void aiPushMessage(aiData *data, const char *role, const char *content);
 static void aiPushMessageRaw(aiData *data, const char *role, const char *content_json);
+static void aiPushMessageBody(aiData *data, const char *role, const char *body_fields);
 static void aiFreeMessages(aiData *data);
 static void aiWorkerSend(aiData *data);
 static void *aiWorkerThread(void *arg);
@@ -424,7 +473,7 @@ static void hkUpdateUsage(aiData *data, const char *resp) {
 
 /*** file/shell helpers ***/
 static char *hkReadFileAll(const char *path, long max_bytes) {
-	FILE *fp = fopen(path, "r");
+	FILE *fp = fopen(path, "rb");
 	if (!fp) return NULL;
 	fseek(fp, 0, SEEK_END);
 	long sz = ftell(fp);
@@ -433,8 +482,8 @@ static char *hkReadFileAll(const char *path, long max_bytes) {
 	if (max_bytes > 0 && sz > max_bytes) sz = max_bytes;
 	char *buf = malloc(sz + 1);
 	if (!buf) { fclose(fp); return NULL; }
-	fread(buf, 1, sz, fp);
-	buf[sz] = '\0';
+	size_t got = fread(buf, 1, (size_t)sz, fp);
+	buf[got] = '\0';
 	fclose(fp);
 	return buf;
 }
@@ -469,11 +518,30 @@ static char *hkListDir(const char *path) {
 	struct dirent *e;
 	while ((e = readdir(d))) {
 		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+		/* Directories get a `/` suffix so the model can tell them apart from
+		   files without a follow-up stat. d_type works on macOS/Linux/BSD;
+		   falls back to stat for filesystems that return DT_UNKNOWN. */
+		int is_dir = 0;
+#ifdef DT_DIR
+		if (e->d_type == DT_DIR) is_dir = 1;
+		else if (e->d_type == DT_UNKNOWN) {
+			char full[PATH_MAX];
+			snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+			struct stat st;
+			if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) is_dir = 1;
+		}
+#else
+		char full[PATH_MAX];
+		snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+		struct stat st;
+		if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) is_dir = 1;
+#endif
 		int n = strlen(e->d_name);
-		out = realloc(out, total + n + 2);
+		out = realloc(out, total + n + 3);
 		memcpy(out + total, e->d_name, n);
-		out[total + n] = '\n';
-		total += n + 1;
+		total += n;
+		if (is_dir) { out[total++] = '/'; }
+		out[total++] = '\n';
 	}
 	closedir(d);
 	if (!out) return strdup("");
@@ -599,6 +667,8 @@ static enum aiProviderType hkParseProvider(const char *s) {
 }
 
 static const char *hkProviderDefaultEndpoint(const char *s) {
+	if (strcmp(s, "ollama") == 0 || strcmp(s, "local") == 0 || strcmp(s, "koi") == 0)
+		return "http://localhost:11434";
 	if (strcmp(s, "deepseek") == 0)   return "https://api.deepseek.com";
 	if (strcmp(s, "mistral") == 0)    return "https://api.mistral.ai";
 	if (strcmp(s, "together") == 0)   return "https://api.together.xyz";
@@ -616,7 +686,10 @@ static void hkApplyProviderAlias(const char *val) {
 	if (t == AI_PROVIDER_NONE) return;
 	E.ai_provider_type = t;
 	const char *ep = hkProviderDefaultEndpoint(val);
-	if (ep && !E.ai_endpoint) E.ai_endpoint = strdup(ep);
+	/* Always swap endpoint when switching provider — a stale endpoint from a prior
+	   provider (e.g. gemini's googleapis URL) would otherwise leak into the new one. */
+	free(E.ai_endpoint);
+	E.ai_endpoint = ep ? strdup(ep) : NULL;
 }
 
 static const char *clProviderConsoleUrl(const char *name) {
@@ -938,7 +1011,11 @@ static void hkAppendSkillBlock(char **buf, size_t *total, const char *name, cons
 	}
 	const char *tail = "\n</skill>\n";
 	int tlen = (int)strlen(tail);
-	*buf = realloc(*buf, *total + hlen + body_len + tlen + 1);
+	size_t need = *total + (size_t)hlen + (size_t)body_len + (size_t)tlen + 1;
+	if (need > (1u << 22)) return; /* 4 MiB hard cap — protects iSh from runaway skill loads */
+	char *nb = realloc(*buf, need);
+	if (!nb) return;
+	*buf = nb;
 	memcpy(*buf + *total, header, hlen); *total += hlen;
 	memcpy(*buf + *total, body, body_len); *total += body_len;
 	memcpy(*buf + *total, tail, tlen); *total += tlen;
@@ -1066,8 +1143,41 @@ static int hkLoadSkills(aiData *data) {
 	closedir(d);
 	if (buf) buf[total] = '\0';
 
-	free(data->system_prompt);
-	data->system_prompt = buf;
+	/* Prepend tool-use guidance. Small models (llama3.2, qwen2.5-small) tend to
+	   invoke tools on greetings / chit-chat without it. Anthropic-tuned models
+	   are mostly fine but the extra line is cheap. */
+	static const char *BASE_PROMPT =
+		"You are hakoCLAW, a terminal AI agent.\n"
+		"\n"
+		"TOOL POLICY — read carefully.\n"
+		"Tools are OPT-IN. Default behavior is plain text. Do NOT call any tool unless the user has explicitly asked you to read, list, write, or run something in the current project directory.\n"
+		"\n"
+		"Examples of when to call tools:\n"
+		"  user: \"read README.md\"            -> call read_file(path=\"README.md\")\n"
+		"  user: \"what's in this folder?\"    -> call list_dir(path=\".\")\n"
+		"  user: \"create test.txt with hi\"  -> call write_file(path=\"test.txt\", content=\"hi\\n\")\n"
+		"\n"
+		"Examples of when to NOT call tools:\n"
+		"  user: \"hello\"                     -> reply in text. NO tools.\n"
+		"  user: \"who are you?\"              -> reply in text. NO tools.\n"
+		"  user: \"explain X\"                 -> reply in text. NO tools.\n"
+		"\n"
+		"NEVER invent paths. Use only paths the user provided or that exist in the current project. Do NOT call list_dir(\"/home/user/project\") or any other placeholder path — that path does not exist on this machine.\n"
+		"When the user has not asked for a file operation, your response must be a normal text reply with zero tool calls.\n";
+	size_t blen = strlen(BASE_PROMPT);
+	size_t need = blen + total + 1;
+	char *combined = malloc(need);
+	if (combined) {
+		memcpy(combined, BASE_PROMPT, blen);
+		if (buf && total > 0) memcpy(combined + blen, buf, total);
+		combined[blen + total] = '\0';
+		free(buf);
+		free(data->system_prompt);
+		data->system_prompt = combined;
+	} else {
+		free(data->system_prompt);
+		data->system_prompt = buf;
+	}
 	return loaded;
 }
 
@@ -1137,6 +1247,20 @@ static void aiPushMessageRaw(aiData *data, const char *role, const char *content
 	data->message_count++;
 }
 
+/* raw=2: `body_fields` holds the trailing fields between role and closing brace,
+   e.g. "\"content\":null,\"tool_calls\":[...]" or "\"tool_call_id\":\"x\",\"content\":\"y\"". */
+static void aiPushMessageBody(aiData *data, const char *role, const char *body_fields) {
+	if (!data || !role || !body_fields) return;
+	if (data->message_count >= data->message_cap) {
+		data->message_cap = data->message_cap ? data->message_cap * 2 : 16;
+		data->messages = realloc(data->messages, sizeof(aiMessage) * data->message_cap);
+	}
+	data->messages[data->message_count].role = strdup(role);
+	data->messages[data->message_count].content = strdup(body_fields);
+	data->messages[data->message_count].raw = 2;
+	data->message_count++;
+}
+
 static void aiFreeMessages(aiData *data) {
 	if (!data || !data->messages) return;
 	for (int i = 0; i < data->message_count; i++) {
@@ -1165,10 +1289,17 @@ static char *aiBuildMessagesJson(aiData *data) {
 			if (!out) return NULL;
 		}
 		if (i > 0) out[len++] = ',';
-		if (data->messages[i].raw) {
+		if (data->messages[i].raw == 1) {
 			int need2 = len + clen + 64;
 			if (need2 >= cap) { while (cap < need2) cap *= 2; out = realloc(out, cap); }
 			len += snprintf(out + len, cap - len, "{\"role\":\"%s\",\"content\":", data->messages[i].role);
+			memcpy(out + len, content, clen);
+			len += clen;
+			out[len++] = '}';
+		} else if (data->messages[i].raw == 2) {
+			int need2 = len + clen + 64;
+			if (need2 >= cap) { while (cap < need2) cap *= 2; out = realloc(out, cap); }
+			len += snprintf(out + len, cap - len, "{\"role\":\"%s\",", data->messages[i].role);
 			memcpy(out + len, content, clen);
 			len += clen;
 			out[len++] = '}';
@@ -1361,7 +1492,7 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		if (clen > 0 && content[clen - 1] != '\n') new_lines++;
 		long old_size = -1;
 		int old_lines = 0;
-		FILE *ef = fopen(full, "r");
+		FILE *ef = fopen(full, "rb");
 		if (ef) {
 			fseek(ef, 0, SEEK_END);
 			old_size = ftell(ef);
@@ -1373,7 +1504,7 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		if (!E.ai_autowrite) {
 			char pending[PATH_MAX + 16];
 			snprintf(pending, sizeof(pending), "%s.hakoc-pending", full);
-			FILE *fp = fopen(pending, "w");
+			FILE *fp = fopen(pending, "wb");
 			if (!fp) { free(path); free(content); return strdup("error: cannot stage pending"); }
 			fwrite(content, 1, clen, fp);
 			fclose(fp);
@@ -1383,7 +1514,7 @@ static char *hkExecTool(const char *name, const char *input_json) {
 			free(path); free(content);
 			return out;
 		}
-		FILE *fp = fopen(full, "w");
+		FILE *fp = fopen(full, "wb");
 		if (!fp) { free(path); free(content); return strdup("error: cannot open for write"); }
 		size_t wrote = fwrite(content, 1, clen, fp);
 		fclose(fp);
@@ -1710,11 +1841,68 @@ static char *hkBuildToolResults(aiData *data, const char *content_array) {
 	return out;
 }
 
+/* Extract raw JSON array value for `key` (e.g. "tool_calls"). Returns malloc'd "[...]". */
+static char *hkExtractRawJsonArray(const char *src, const char *key) {
+	char needle[64];
+	snprintf(needle, sizeof(needle), "\"%s\":[", key);
+	const char *p = strstr(src, needle);
+	if (!p) return NULL;
+	p += strlen(needle) - 1; /* point at '[' */
+	const char *start = p;
+	int depth = 0, in_str = 0, esc = 0;
+	while (*p) {
+		if (esc) { esc = 0; p++; continue; }
+		if (*p == '\\') { esc = 1; p++; continue; }
+		if (*p == '"') { in_str = !in_str; p++; continue; }
+		if (!in_str) {
+			if (*p == '[') depth++;
+			else if (*p == ']') { depth--; if (depth == 0) { p++; break; } }
+		}
+		p++;
+	}
+	size_t n = p - start;
+	char *out = malloc(n + 1);
+	memcpy(out, start, n);
+	out[n] = '\0';
+	return out;
+}
+
+/* OpenAI/Ollama function-calling tool loop. Preserves tool_calls on assistant
+   message and emits tool_call_id on each tool reply — required by strict
+   validators (Gemini OpenAI-compat returns 400 INVALID_ARGUMENT otherwise). */
 static int hkFnToolExecAll(aiData *data, const char *response) {
+	char *tool_calls_raw = hkExtractRawJsonArray(response, "tool_calls");
+	if (!tool_calls_raw) return 0;
+
+	/* Push assistant message body with content (text or null) + tool_calls preserved. */
+	pthread_mutex_lock(&data->lock);
+	const char *txt = data->current_response;
+	int has_txt = txt && *txt;
+	size_t tlen = strlen(tool_calls_raw);
+	size_t txtlen = has_txt ? strlen(txt) : 0;
+	size_t bcap = tlen + txtlen * 6 + 128;
+	char *body = malloc(bcap);
+	if (has_txt) {
+		char *esc = malloc(txtlen * 6 + 8);
+		hkJsonEscapeInto(txt, esc, txtlen * 6 + 8);
+		snprintf(body, bcap, "\"content\":\"%s\",\"tool_calls\":%s", esc, tool_calls_raw);
+		free(esc);
+	} else {
+		snprintf(body, bcap, "\"content\":null,\"tool_calls\":%s", tool_calls_raw);
+	}
+	aiPushMessageBody(data, "assistant", body);
+	pthread_mutex_unlock(&data->lock);
+	free(body);
+	free(tool_calls_raw);
+
+	int count = 0;
 	const char *p = strstr(response, "\"tool_calls\":[");
 	if (!p) return 0;
-	int count = 0;
 	while ((p = strstr(p, "\"function\""))) {
+		/* Walk back to the enclosing tool_call object to grab its id. */
+		const char *obj_start = p;
+		while (obj_start > response && *obj_start != '{') obj_start--;
+		char *tc_id = hkExtractJsonString(obj_start, "id");
 		char *fname = hkExtractJsonString(p, "name");
 		char *args_obj = hkExtractJsonObject(p, "arguments");
 		if (!args_obj) {
@@ -1724,14 +1912,29 @@ static int hkFnToolExecAll(aiData *data, const char *response) {
 				free(args_str);
 			}
 		}
-		if (!fname || !args_obj) { free(fname); free(args_obj); p++; continue; }
+		if (!fname || !args_obj) { free(tc_id); free(fname); free(args_obj); p++; continue; }
 		hkAnnounceTool(data, fname, args_obj);
 		char *result = hkExecTool(fname, args_obj);
 		hkAnnounceToolResult(data, result);
+
+		const char *r = result ? result : "";
+		size_t rlen = strlen(r);
+		char *resc = malloc(rlen * 6 + 8);
+		hkJsonEscapeInto(r, resc, rlen * 6 + 8);
+		size_t idlen = tc_id ? strlen(tc_id) : 0;
+		size_t reslen = strlen(resc);
+		size_t tcap = idlen + reslen + 96;
+		char *tbody = malloc(tcap);
+		if (tc_id) {
+			snprintf(tbody, tcap, "\"tool_call_id\":\"%s\",\"content\":\"%s\"", tc_id, resc);
+		} else {
+			snprintf(tbody, tcap, "\"content\":\"%s\"", resc);
+		}
 		pthread_mutex_lock(&data->lock);
-		aiPushMessage(data, "tool", result ? result : "");
+		aiPushMessageBody(data, "tool", tbody);
 		pthread_mutex_unlock(&data->lock);
-		free(fname); free(args_obj); free(result);
+		free(tbody); free(resc);
+		free(tc_id); free(fname); free(args_obj); free(result);
 		count++;
 		p++;
 	}
@@ -2017,12 +2220,7 @@ static void *aiWorkerThread(void *arg) {
 		}
 
 		if (tool_use_fn) {
-			pthread_mutex_lock(&data->lock);
-			aiPushMessage(data, "assistant", content && *content ? content : "(calling tools)");
-			pthread_mutex_unlock(&data->lock);
-
 			int n = hkFnToolExecAll(data, full_response);
-
 			free(content);
 			free(full_response);
 			if (n == 0) break;
@@ -2078,7 +2276,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	if (arg) { while (*arg == ' ') arg++; }
 
 	if (strncmp(cmd, "help", cmdlen) == 0 && cmdlen == 4) {
-		aiAddHistory(data, "/clear  /help  /model <id>  /provider <name>  /login [<provider>]");
+		aiAddHistory(data, "/clear  /help  /model <id>  /models  /provider <name>  /login [<provider>]");
 		aiAddHistory(data, "/history [local|global]  /skills [reload]");
 		aiAddHistory(data, "/skill install <url>  /skill uninstall <name>");
 		aiAddHistory(data, "/tools on|off  /trust [revoke]  /usage  /quit");
@@ -2095,7 +2293,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			hkApplyProviderAlias(prov);
 			hkSaveSession();
 			aiAddHistory(data, "ollama is local — no API key needed.");
-			aiAddHistory(data, "ensure `ollama serve` is running, then /model <id> (e.g. llama3.2)");
+			aiAddHistory(data, "ensure `ollama serve` is running, then /models to list, /model <id> to pick.");
 			return 1;
 		}
 		const char *url = clProviderConsoleUrl(prov);
@@ -2149,6 +2347,66 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			snprintf(msg, sizeof(msg), "model: %s", E.ai_model ? E.ai_model : "(unset)");
 			aiAddHistory(data, msg);
 		}
+		return 1;
+	}
+	if (strncmp(cmd, "models", cmdlen) == 0 && cmdlen == 6) {
+		const char *endpoint = E.ai_endpoint;
+		if (!endpoint || !*endpoint) endpoint = "http://localhost:11434";
+		char curlcmd[512];
+		snprintf(curlcmd, sizeof(curlcmd),
+			"curl -s --max-time 3 %s/api/tags 2>/dev/null", endpoint);
+		FILE *fp = popen(curlcmd, "r");
+		if (!fp) {
+			aiAddHistory(data, "/models: popen failed");
+			return 1;
+		}
+		size_t cap = 8192, len = 0;
+		char *buf = malloc(cap);
+		if (!buf) { pclose(fp); return 1; }
+		size_t got;
+		while ((got = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+			len += got;
+			if (len + 1 >= cap) {
+				if (cap >= (1u << 22)) break;
+				cap *= 2;
+				char *nb = realloc(buf, cap);
+				if (!nb) break;
+				buf = nb;
+			}
+		}
+		buf[len] = '\0';
+		pclose(fp);
+		if (len == 0) {
+			char msg[256];
+			snprintf(msg, sizeof(msg), "/models: no response from %s (is `ollama serve` running?)", endpoint);
+			aiAddHistory(data, msg);
+			free(buf);
+			return 1;
+		}
+		int count = 0;
+		const char *p = buf;
+		aiAddHistory(data, "available models:");
+		while ((p = strstr(p, "\"name\":\"")) != NULL) {
+			p += 8;
+			const char *e = p;
+			while (*e && *e != '"') e++;
+			if (!*e) break;
+			char line[256];
+			int n = (int)(e - p);
+			if (n > 200) n = 200;
+			snprintf(line, sizeof(line), "  %.*s", n, p);
+			aiAddHistory(data, line);
+			count++;
+			p = e;
+		}
+		if (count == 0) {
+			aiAddHistory(data, "  (none — pull one with `ollama pull <model>`)");
+		} else {
+			char msg[64];
+			snprintf(msg, sizeof(msg), "%d model(s). use /model <name> to select.", count);
+			aiAddHistory(data, msg);
+		}
+		free(buf);
 		return 1;
 	}
 	if (strncmp(cmd, "provider", cmdlen) == 0 && cmdlen == 8) {
@@ -3171,44 +3429,190 @@ static int clCmdUpdate(int force) {
 }
 
 /*** REPL ***/
+
+/* Visible cell width — strips ANSI escapes and counts UTF-8 continuation bytes
+   as zero cells. Box-drawing + block-element glyphs are 1 cell each. */
+static int clCellWidth(const char *s) {
+	int n = 0;
+	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+		if (*p == 0x1b && p[1] == '[') {
+			while (*p && *p != 'm') p++;
+			if (!*p) return n;
+		} else if ((*p & 0xc0) != 0x80) {
+			n++;
+		}
+	}
+	return n;
+}
+
+static void clBoxTop(int inner) {
+	fputs("╔", stdout);
+	for (int i = 0; i < inner; i++) fputs("═", stdout);
+	fputs("╗\n", stdout);
+}
+static void clBoxBot(int inner) {
+	fputs("╚", stdout);
+	for (int i = 0; i < inner; i++) fputs("═", stdout);
+	fputs("╝\n", stdout);
+}
+static void clBoxRow(int inner, const char *content) {
+	fputs("║", stdout);
+	int w = clCellWidth(content);
+	fputs(content, stdout);
+	int pad = inner - w;
+	for (int i = 0; i < pad; i++) putchar(' ');
+	fputs("║\n", stdout);
+}
+static void clBoxRow2(int inner, int left_w, const char *l, const char *r) {
+	fputs("║", stdout);
+	int lw = clCellWidth(l);
+	fputs(l, stdout);
+	int p1 = left_w - lw;
+	for (int i = 0; i < (p1 > 0 ? p1 : 0); i++) putchar(' ');
+	int rw = clCellWidth(r);
+	fputs(r, stdout);
+	int p2 = inner - (p1 > 0 ? left_w : lw) - rw;
+	for (int i = 0; i < (p2 > 0 ? p2 : 0); i++) putchar(' ');
+	fputs("║\n", stdout);
+}
+
+/* Pick `n` deterministic tips. Seed = day-of-year, so same session shows the
+   same pair but they rotate daily. Caller passes out[] of length n. */
+static void clPickTips(int *out, int n) {
+	int total = 0;
+	while (CL_TIPS[total]) total++;
+	if (total <= 0) { for (int i = 0; i < n; i++) out[i] = -1; return; }
+	time_t now = time(NULL);
+	struct tm *tm = localtime(&now);
+	int seed = tm ? tm->tm_yday : 0;
+	int picked = 0;
+	int start = seed % total;
+	for (int step = 0; step < total && picked < n; step++) {
+		int idx = (start + step) % total;
+		int dup = 0;
+		for (int j = 0; j < picked; j++) if (out[j] == idx) { dup = 1; break; }
+		if (!dup) out[picked++] = idx;
+	}
+	while (picked < n) out[picked++] = -1;
+}
+
 static void clBanner(aiData *data) {
-	clPrintMascot();
-	if (E.color_enabled) {
-		printf("  %shakoCLAW v%s%s  %sprovider:%s %s  %smodel:%s %s  %strust:%s %s\n",
-			ANSI_BOLD, CLAW_VERSION, ANSI_RESET,
-			ANSI_DIM, ANSI_RESET, hkProviderName(E.ai_provider_type),
-			ANSI_DIM, ANSI_RESET, E.ai_model ? E.ai_model : "(unset)",
-			ANSI_DIM, ANSI_RESET, hkProjectTrusted() ? "granted" : "off");
-	} else {
-		printf("  hakoCLAW v%s — provider: %s, model: %s, trust: %s\n",
-			CLAW_VERSION,
-			hkProviderName(E.ai_provider_type),
-			E.ai_model ? E.ai_model : "(unset)",
-			hkProjectTrusted() ? "granted" : "off");
-	}
-	if (E.session_resumed) {
-		long ago = (long)time(NULL) - E.session_last_used;
-		const char *unit; long n;
-		if (ago < 3600) { n = ago / 60; unit = "m"; }
-		else if (ago < 86400) { n = ago / 3600; unit = "h"; }
-		else { n = ago / 86400; unit = "d"; }
-		printf("  %ssession:%s resumed (%ld%s, %d turns)\n",
-			E.color_enabled ? ANSI_DIM : "", E.color_enabled ? ANSI_RESET : "",
-			n, unit, E.session_turn_count);
-	} else {
-		printf("  %ssession:%s new (%s)\n",
-			E.color_enabled ? ANSI_DIM : "", E.color_enabled ? ANSI_RESET : "",
-			E.session_id ? E.session_id : "?");
-	}
-	if (E.ai_provider_type == AI_PROVIDER_NONE) {
-		printf("  (set ai_provider in ~/.hakocrc, or use /provider <name>)\n");
-	}
+	int cols = clTermCols();
+	int rows = 24;
+#ifndef _WIN32
+	struct winsize ws;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != -1 && ws.ws_row > 0) rows = ws.ws_row;
+#endif
+
 	int sk = hkLoadSkills(data);
-	if (sk > 0) printf("  loaded %d skill(s)\n", sk);
-	printf("  %s/help for commands · Ctrl-C cancels stream · /quit to exit%s\n",
-		E.color_enabled ? ANSI_DIM : "", E.color_enabled ? ANSI_RESET : "");
-	if (E.color_enabled) printf("  %s───────────────────────────────────────────────%s\n", ANSI_DIM, ANSI_RESET);
-	else printf("---\n");
+	const char *prov = hkProviderName(E.ai_provider_type);
+	const char *model = E.ai_model ? E.ai_model : "(unset)";
+	const char *trust_str = hkProjectTrusted() ? "on" : "off";
+	const char *sess_state = E.session_resumed ? "resumed" : "new";
+	const char *sess_id = E.session_id ? E.session_id : "?";
+
+	const int INNER = 62;
+
+	/* Old compact fallback when terminal can't host the box. */
+	if (E.compact || !E.color_enabled || cols < INNER + 2 || rows < 14) {
+		clPrintMascot();
+		if (E.color_enabled) {
+			printf("  %shakoCLAW v%s%s  %sprovider:%s %s  %smodel:%s %s  %strust:%s %s\n",
+				ANSI_BOLD, CLAW_VERSION, ANSI_RESET,
+				ANSI_DIM, ANSI_RESET, prov,
+				ANSI_DIM, ANSI_RESET, model,
+				ANSI_DIM, ANSI_RESET, trust_str);
+		} else {
+			printf("  hakoCLAW v%s — provider: %s, model: %s, trust: %s\n",
+				CLAW_VERSION, prov, model, trust_str);
+		}
+		printf("  %ssession:%s %s (%s)\n",
+			E.color_enabled ? ANSI_DIM : "", E.color_enabled ? ANSI_RESET : "",
+			sess_state, sess_id);
+		if (sk > 0) printf("  loaded %d skill(s)\n", sk);
+		printf("  %s/help · ctrl-c cancels · /quit%s\n",
+			E.color_enabled ? ANSI_DIM : "", E.color_enabled ? ANSI_RESET : "");
+		fflush(stdout);
+		return;
+	}
+
+	int tips[2]; clPickTips(tips, 2);
+	const char *new0 = CL_NEW[0] ? CL_NEW[0] : "";
+	const char *new1 = CL_NEW[1] ? CL_NEW[1] : "";
+	const char *tip0 = (tips[0] >= 0) ? CL_TIPS[tips[0]] : "";
+	const char *tip1 = (tips[1] >= 0) ? CL_TIPS[tips[1]] : "";
+
+	if (E.color_enabled) fputs(ANSI_AI, stdout);
+	clBoxTop(INNER);
+
+	/* Status — 2 rows */
+	char buf[256], rbuf[256];
+	snprintf(buf, sizeof(buf), " hakoCLAW v%s • %s • %s", CLAW_VERSION, prov, model);
+	clBoxRow(INNER, buf);
+	snprintf(buf, sizeof(buf), " trust: %s • session: %s (%s)", trust_str, sess_state, sess_id);
+	clBoxRow(INNER, buf);
+
+	if (rows >= 26) {
+		/* LARGER — mascot left, HAKO+CLAW figlet right (12 rows). # NEW + # TIPS
+		   stacked below at full width so long bullets don't collide with CLAW. */
+		const int LEFT_W = 28;
+		const char *mascot[8] = {0};
+		int mc = E.mascot_count > 0 ? E.mascot_count : 0;
+		for (int i = 0; i < mc && i < 8; i++) mascot[i] = E.mascot_lines[i];
+		while (mc < 6) mascot[mc++] = "";
+
+		snprintf(buf, sizeof(buf), " %s", mascot[0]);
+		clBoxRow2(INNER, LEFT_W, buf, "");
+		for (int i = 0; i < 5; i++) {
+			snprintf(buf, sizeof(buf), " %s", mascot[i+1]);
+			clBoxRow2(INNER, LEFT_W, buf, CL_FIGLET_HAKO[i]);
+		}
+		if (sk > 0) snprintf(buf, sizeof(buf), " loaded %d skill(s)", sk);
+		else        snprintf(buf, sizeof(buf), " ");
+		clBoxRow2(INNER, LEFT_W, buf, CL_FIGLET_HAKO[5]);
+		for (int i = 0; i < 6; i++) clBoxRow2(INNER, LEFT_W, "", CL_FIGLET_CLAW[i]);
+
+		clBoxRow(INNER, "");
+		clBoxRow(INNER, " # NEW");
+		snprintf(buf, sizeof(buf), "   - %s", new0);
+		clBoxRow(INNER, buf);
+		snprintf(buf, sizeof(buf), "   - %s", new1);
+		clBoxRow(INNER, buf);
+		clBoxRow(INNER, " # TIPS");
+		snprintf(buf, sizeof(buf), "   - %s", tip0);
+		clBoxRow(INNER, buf);
+		snprintf(buf, sizeof(buf), "   - %s", tip1);
+		clBoxRow(INNER, buf);
+		clBoxRow(INNER, "");
+	} else {
+		/* SMALLER — mascot left, sections inline right. */
+		const int LEFT_W = 17;
+		const char *mascot[8] = {0};
+		int mc = E.mascot_count > 0 ? E.mascot_count : 0;
+		for (int i = 0; i < mc && i < 8; i++) mascot[i] = E.mascot_lines[i];
+		while (mc < 6) mascot[mc++] = "";
+
+		snprintf(buf, sizeof(buf), " %s", mascot[0]);
+		clBoxRow2(INNER, LEFT_W, buf, "");
+		snprintf(buf, sizeof(buf), " %s", mascot[1]);
+		snprintf(rbuf, sizeof(rbuf), sk > 0 ? " loaded %d skill(s)" : " ", sk);
+		clBoxRow2(INNER, LEFT_W, buf, rbuf);
+		snprintf(buf, sizeof(buf), " %s", mascot[2]);
+		snprintf(rbuf, sizeof(rbuf), " # NEW                    # TIPS");
+		clBoxRow2(INNER, LEFT_W, buf, rbuf);
+		snprintf(buf, sizeof(buf), " %s", mascot[3]);
+		snprintf(rbuf, sizeof(rbuf), " - %-22.22s - %.16s", new0, tip0);
+		clBoxRow2(INNER, LEFT_W, buf, rbuf);
+		snprintf(buf, sizeof(buf), " %s", mascot[4]);
+		snprintf(rbuf, sizeof(rbuf), " - %-22.22s - %.16s", new1, tip1);
+		clBoxRow2(INNER, LEFT_W, buf, rbuf);
+		snprintf(buf, sizeof(buf), " %s", mascot[5]);
+		clBoxRow2(INNER, LEFT_W, buf, "");
+	}
+
+	clBoxRow(INNER, " /help for commands  •  ctrl-c cancels stream  •  /quit to exit");
+	clBoxBot(INNER);
+	if (E.color_enabled) fputs(ANSI_RESET, stdout);
 	fflush(stdout);
 }
 
@@ -3286,8 +3690,27 @@ static void clStartupMenu(aiData *data) {
 		if (getcwd(cwd, sizeof(cwd))) {
 			printf("\n  %sTrust this directory for tool access?%s\n",
 				E.color_enabled ? ANSI_BOLD : "", E.color_enabled ? ANSI_RESET : "");
-			printf("  cwd: %s%s%s\n",
-				E.color_enabled ? ANSI_DIM : "", cwd, E.color_enabled ? ANSI_RESET : "");
+			{
+				/* Wrap cwd line at terminal width so long iCloud paths don't trail off. */
+				int cols = clTermCols();
+				int avail = cols - 8; /* "  cwd: " indent + safety */
+				if (avail < 24) avail = 24;
+				if (E.color_enabled) printf("  cwd: %s", ANSI_DIM);
+				else printf("  cwd: ");
+				const char *p = cwd;
+				int rem = (int)strlen(cwd);
+				int first = 1;
+				while (rem > 0) {
+					int chunk = rem > avail ? avail : rem;
+					if (!first) printf("       "); /* align under "cwd: " */
+					fwrite(p, 1, chunk, stdout);
+					putchar('\n');
+					p += chunk;
+					rem -= chunk;
+					first = 0;
+				}
+				if (E.color_enabled) printf("%s", ANSI_RESET);
+			}
 			printf("  (untrusted = no read_file, list_dir, write_file, run_shell)\n");
 			if (clPromptYN("  grant trust?", 0)) {
 				if (hkGrantProjectTrust()) printf("  %strusted.%s\n",
@@ -3441,6 +3864,7 @@ static void clUsage(void) {
 	printf("  --mascot <path> load custom ASCII mascot from file\n");
 	printf("  --anim <name>   pin animation: braille|dots|bar|pulse|bounce|ghost|arrows|blocks\n");
 	printf("  --no-color      disable ANSI color/animation\n");
+	printf("  --compact       skip figlet + framed banner (one-liner only)\n");
 	printf("  --debug         dump raw API responses to stderr\n");
 	printf("  -h --help       this help\n");
 	printf("  -v --version    print version\n");
@@ -3486,6 +3910,7 @@ int main(int argc, char **argv) {
 		}
 		if (strcmp(a, "--no-color") == 0) { E.color_enabled = 0; continue; }
 		if (strcmp(a, "--debug") == 0) { E.debug = 1; continue; }
+		if (strcmp(a, "--compact") == 0) { E.compact = 1; continue; }
 		fprintf(stderr, "unknown arg: %s (try --help)\n", a);
 		return 2;
 	}
@@ -3500,7 +3925,13 @@ int main(int argc, char **argv) {
 	if (one_shot) {
 		rc = clOneShot(&G_AI, one_shot);
 	} else {
+		/* Terminal title — kanji-led brand mark (爪 = claw). OSC 0 sets icon + window
+		   title; unsupported terminals silently ignore. Restored on exit below. */
+		printf("\x1b]0;爪 hakoCLAW\x07");
+		fflush(stdout);
 		rc = clRepl(&G_AI);
+		printf("\x1b]0;\x07");
+		fflush(stdout);
 	}
 
 	clCleanupAI(&G_AI);
