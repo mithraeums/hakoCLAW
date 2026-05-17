@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define CLAW_VERSION "0.1.3"
+#define CLAW_VERSION "0.1.4"
 #define CLAW_REPO    "mithraeums/hakoCLAW"
 
 #include <ctype.h>
@@ -119,17 +119,19 @@ static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define AI_HISTORY_MAX 1000
 
-/* ANSI for CLI render. */
+/* Mithraeum palette (24-bit truecolor). Matches hako default + site banners.
+   color_enabled gate skips escapes on non-TTY; truecolor terminals render
+   gold/paper/rust as designed, 256-color terms approximate, 16-color degrades. */
 #define ANSI_DIM     "\x1b[2m"
 #define ANSI_BOLD    "\x1b[1m"
 #define ANSI_RESET   "\x1b[0m"
-#define ANSI_USER    "\x1b[36m"   /* cyan */
-#define ANSI_AI      "\x1b[32m"   /* green */
-#define ANSI_SYS     "\x1b[2m"    /* dim */
-#define ANSI_ERR     "\x1b[31m"   /* red */
-#define ANSI_TOOL    "\x1b[33m"   /* yellow */
-#define ANSI_MAGENTA "\x1b[35m"
-#define ANSI_BLUE    "\x1b[34m"
+#define ANSI_USER    "\x1b[38;2;201;169;97m"   /* gold — user prompt */
+#define ANSI_AI      "\x1b[38;2;232;223;200m"  /* paper — AI response */
+#define ANSI_SYS     "\x1b[38;2;122;113;101m"  /* dim chalk — system */
+#define ANSI_ERR     "\x1b[38;2;168;84;59m"    /* rust — errors */
+#define ANSI_TOOL    "\x1b[38;2;184;137;90m"   /* bronze — tool calls */
+#define ANSI_MAGENTA "\x1b[38;2;212;181;114m"  /* bright gold */
+#define ANSI_BLUE    "\x1b[38;2;138;154;108m"  /* sage */
 #define ANSI_CLR_LINE "\r\x1b[K"
 
 #ifdef _WIN32
@@ -220,6 +222,7 @@ struct clConfig {
 	int anim_force_style;  /* -1 = rotate, 0..N = pin */
 	int debug;
 	int compact;           /* --compact: skip figlet + framed box on banner */
+	int pipe_mode;         /* --pipe: JSONL I/O with hako editor (no REPL UI) */
 };
 
 struct clConfig E;
@@ -1181,8 +1184,49 @@ static int hkLoadSkills(aiData *data) {
 	return loaded;
 }
 
+/*** pipe emit helpers (--pipe mode) ***/
+
+static void clPipeEscape(const char *src, char *dst, int dsz) {
+	int d = 0;
+	for (const char *p = src; *p && d < dsz - 2; p++) {
+		unsigned char c = (unsigned char)*p;
+		if      (c == '"')  { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='"';  } }
+		else if (c == '\\') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='\\'; } }
+		else if (c == '\n') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='n';  } }
+		else if (c == '\r') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='r';  } }
+		else if (c == '\t') { if (d < dsz-3) { dst[d++]='\\'; dst[d++]='t';  } }
+		else                { dst[d++] = (char)c; }
+	}
+	dst[d] = '\0';
+}
+
+static void clPipeEmitMsg(const char *role, const char *text) {
+	char esc[4096];
+	clPipeEscape(text ? text : "", esc, sizeof(esc));
+	printf("{\"type\":\"message\",\"role\":\"%s\",\"text\":\"%s\"}\n", role, esc);
+	fflush(stdout);
+}
+
+static void clPipeEmitDisplay(const char *type, const char *display) {
+	char esc[512];
+	clPipeEscape(display ? display : "", esc, sizeof(esc));
+	printf("{\"type\":\"%s\",\"display\":\"%s\"}\n", type, esc);
+	fflush(stdout);
+}
+
+static void clPipeEmitRaw(const char *json) {
+	puts(json);
+	fflush(stdout);
+}
+
 /*** history (CLI render) — aiAddHistory variants print + store ***/
 static void clPrintRoleLine(unsigned char role, const char *text) {
+	if (E.pipe_mode) {
+		const char *rname = (role == HK_ROLE_USER) ? "user" :
+		                    (role == HK_ROLE_AI)   ? "ai"   : "system";
+		clPipeEmitMsg(rname, text);
+		return;
+	}
 	const char *prefix, *color;
 	switch (role) {
 	case HK_ROLE_USER: prefix = "▌ "; color = ANSI_USER; break;
@@ -1533,6 +1577,12 @@ static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj
 	char *cmd = hkExtractJsonString(args_obj, "cmd");
 	if (path) { snprintf(arg_summary, sizeof(arg_summary), "%s", path); free(path); }
 	else if (cmd) { snprintf(arg_summary, sizeof(arg_summary), "%.80s", cmd); free(cmd); }
+	if (E.pipe_mode) {
+		char display[256];
+		snprintf(display, sizeof(display), "→ %s(%s)", fname, arg_summary);
+		clPipeEmitDisplay("tool_start", display);
+		return;
+	}
 	if (E.color_enabled) printf("%s→ %s(%s)%s\n", ANSI_TOOL, fname, arg_summary, ANSI_RESET);
 	else printf("→ %s(%s)\n", fname, arg_summary);
 	fflush(stdout);
@@ -1542,6 +1592,13 @@ static void hkAnnounceToolResult(aiData *data, const char *result) {
 	(void)data;
 	int len = result ? (int)strlen(result) : 0;
 	int is_err = result && strncmp(result, "error:", 6) == 0;
+	if (E.pipe_mode) {
+		char display[256];
+		if (is_err) snprintf(display, sizeof(display), "%s", result ? result : "error");
+		else snprintf(display, sizeof(display), "  ← %d bytes", len);
+		clPipeEmitDisplay("tool_end", display);
+		return;
+	}
 	if (is_err) {
 		if (E.color_enabled) printf("  %s%s%s\n", ANSI_ERR, result, ANSI_RESET);
 		else printf("  %s\n", result);
@@ -2253,6 +2310,16 @@ static void *aiWorkerThread(void *arg) {
 	if (iter >= max_iters && used_tool) aiAddHistory(data, "(tool loop cap reached)");
 	data->streaming = 0;
 	pthread_mutex_unlock(&data->lock);
+
+	if (E.pipe_mode) {
+		char json[256];
+		snprintf(json, sizeof(json),
+			"{\"type\":\"done\",\"turn\":%d,\"in\":%d,\"out\":%d,\"session\":\"%s\"}",
+			E.session_turn_count,
+			data->last_in_tokens, data->last_out_tokens,
+			E.session_id ? E.session_id : "");
+		clPipeEmitRaw(json);
+	}
 
 	return NULL;
 }
@@ -3610,7 +3677,7 @@ static void clBanner(aiData *data) {
 		clBoxRow2(INNER, LEFT_W, buf, "");
 	}
 
-	clBoxRow(INNER, " /help for commands  •  ctrl-c cancels stream  •  /quit to exit");
+	clBoxRow(INNER, "/help for commands  •  ctrl-c cancels stream  •  /quit to exit");
 	clBoxBot(INNER);
 	if (E.color_enabled) fputs(ANSI_RESET, stdout);
 	fflush(stdout);
@@ -3805,6 +3872,80 @@ static int clOneShot(aiData *data, const char *prompt) {
 	return 0;
 }
 
+/* --pipe mode: hako editor talks JSONL over stdin/stdout.
+   stdin  ← {"type":"prompt","text":"..."} | {"type":"slash","cmd":"..."} | {"type":"quit"}
+   stdout → {"type":"init",...} | {"type":"message",...} | {"type":"tool_start/end",...} | {"type":"done",...} */
+static int clPipeMode(aiData *data) {
+	/* emit init so hako knows session state */
+	char init_json[512];
+	snprintf(init_json, sizeof(init_json),
+		"{\"type\":\"init\",\"session\":\"%s\",\"resumed\":%d,\"turns\":%d,\"provider\":\"%s\",\"model\":\"%s\"}",
+		E.session_id ? E.session_id : "",
+		E.session_resumed ? 1 : 0,
+		E.session_turn_count,
+		hkProviderName(E.ai_provider_type),
+		E.ai_model ? E.ai_model : "");
+	clPipeEmitRaw(init_json);
+
+	if (E.session_resumed && data->history_count == 0)
+		hkLoadHistoryTail(data, 40);
+	hkLoadSkills(data);
+
+	char line[4096];
+	while (fgets(line, sizeof(line), stdin)) {
+		int len = (int)strlen(line);
+		while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+		if (len == 0) continue;
+
+		char *type = hkExtractJsonString(line, "type");
+		if (!type) continue;
+
+		if (strcmp(type, "quit") == 0) {
+			free(type); break;
+		}
+
+		if (strcmp(type, "prompt") == 0) {
+			char *text = hkExtractJsonString(line, "text");
+			if (text && *text) {
+				free(data->current_prompt);
+				data->current_prompt = text;
+				if (E.ai_provider_type == AI_PROVIDER_NONE) {
+					clPipeEmitMsg("system", "No provider set. Configure ~/.hakocrc (ai_provider=gemini/ollama/anthropic)");
+					char done[128];
+					snprintf(done, sizeof(done),
+						"{\"type\":\"done\",\"turn\":%d,\"in\":0,\"out\":0,\"session\":\"%s\"}",
+						E.session_turn_count, E.session_id ? E.session_id : "");
+					clPipeEmitRaw(done);
+				} else {
+					hkLogMessage("user", text);
+					E.session_turn_count++;
+					hkSaveSession();
+					aiWorkerSend(data);
+					clWaitWorker(data);
+				}
+			} else {
+				free(text);
+			}
+		} else if (strcmp(type, "slash") == 0) {
+			char *cmd = hkExtractJsonString(line, "cmd");
+			if (cmd) {
+				int r = hkHandleSlash(data, cmd);
+				free(cmd);
+				/* emit done so hako knows the slash is processed */
+				char done[128];
+				snprintf(done, sizeof(done),
+					"{\"type\":\"done\",\"turn\":%d,\"in\":0,\"out\":0,\"session\":\"%s\"}",
+					E.session_turn_count, E.session_id ? E.session_id : "");
+				clPipeEmitRaw(done);
+				if (r == 2) { free(type); break; }
+			}
+		}
+
+		free(type);
+	}
+	return 0;
+}
+
 static int clRepl(aiData *data) {
 	clBanner(data);
 	clStartupMenu(data);
@@ -3864,6 +4005,7 @@ static void clUsage(void) {
 	printf("  --mascot <path> load custom ASCII mascot from file\n");
 	printf("  --anim <name>   pin animation: braille|dots|bar|pulse|bounce|ghost|arrows|blocks\n");
 	printf("  --no-color      disable ANSI color/animation\n");
+	printf("  --pipe          JSONL I/O mode for hako editor integration\n");
 	printf("  --compact       skip figlet + framed banner (one-liner only)\n");
 	printf("  --debug         dump raw API responses to stderr\n");
 	printf("  -h --help       this help\n");
@@ -3911,6 +4053,7 @@ int main(int argc, char **argv) {
 		if (strcmp(a, "--no-color") == 0) { E.color_enabled = 0; continue; }
 		if (strcmp(a, "--debug") == 0) { E.debug = 1; continue; }
 		if (strcmp(a, "--compact") == 0) { E.compact = 1; continue; }
+		if (strcmp(a, "--pipe") == 0) { E.pipe_mode = 1; continue; }
 		fprintf(stderr, "unknown arg: %s (try --help)\n", a);
 		return 2;
 	}
@@ -3922,7 +4065,9 @@ int main(int argc, char **argv) {
 
 	clInitAI(&G_AI);
 	int rc;
-	if (one_shot) {
+	if (E.pipe_mode) {
+		rc = clPipeMode(&G_AI);
+	} else if (one_shot) {
 		rc = clOneShot(&G_AI, one_shot);
 	} else {
 		/* Terminal title — kanji-led brand mark (爪 = claw). OSC 0 sets icon + window

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hakoCLAW/releases"><img src="https://img.shields.io/badge/version-v0.1.3-b89656?style=flat-square&labelColor=14130f" alt="v0.1.3"/></a>
+  <a href="https://github.com/mithraeums/hakoCLAW/releases"><img src="https://img.shields.io/badge/version-v0.1.4-b89656?style=flat-square&labelColor=14130f" alt="v0.1.4"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13%2B-c8c2b2?style=flat-square&labelColor=14130f" alt="13+ providers"/>
@@ -23,7 +23,7 @@
 <br>
 
 ```
-    █       █     hakoCLAW v0.1.3
+    █       █     hakoCLAW v0.1.4
    ███     ███    provider: gemini
  ███████████████  model: gemini-2.5-flash
  ███░████████░██  trust: granted
@@ -206,11 +206,9 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### v0.1.3 (Latest)<br>
-- **Framed Banner** with `# NEW`/`# TIPS`
-- **Fixed tool-calls** `/models` for ollama, Gemini
-- **Windows byte-exact** read/write
-- **Marked directories** via `list_dir`
+### v0.1.4 (Latest)<br>
+- **`--pipe` mode** for hako integration — JSONL I/O over stdin/stdout. Hako spawns `hakoc --pipe` once per Rei pane and drives the agent without embedding it.
+- **Mithraeum palette by default** — gold / paper / rust / dim chalk truecolor. Matches the hako default theme + site banners + icon.
 
 See [CHANGELOG.md](CHANGELOG.md) for full history.
 

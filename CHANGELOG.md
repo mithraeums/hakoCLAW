@@ -3,6 +3,12 @@
 All notable changes to hakoCLAW. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.1.4]
+
+### Added
+- **`--pipe` mode** — JSONL I/O over stdin/stdout for hako editor integration. Hako spawns `hakoc --pipe` once per Rei pane, sends `{"type":"prompt"|"slash"|"quit"}`, receives `{"type":"init"|"message"|"tool_start"|"tool_end"|"done"|"error"}`. No REPL UI in pipe mode — events stream as one JSON object per line. Enables editor to delegate the entire agent loop without embedding the curl / tool / provider layer in `hako.c`.
+- **Mithraeum palette by default** — `ANSI_USER/AI/SYS/ERR/TOOL` rewritten as 24-bit truecolor (gold / paper / dim chalk / rust / bronze). Matches the hako default theme + site banners + icon scratches. Falls back to dim on non-TTY (color_enabled guard unchanged).
+
 ## [v0.1.3]
 
 ### Added

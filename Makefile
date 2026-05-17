@@ -34,9 +34,16 @@ ifeq ($(PLATFORM),macos)
     endif
 endif
 
-.PHONY: all clean asan
+.PHONY: all clean asan icons
 
 all: $(BIN)
+
+# ---------- icons ----------
+# Regenerate icon/hakoCLAW.{icns,ico,png} from icon/hakoCLAW.svg.
+# Requires rsvg-convert or ImageMagick. iconutil (macOS) → .icns, magick → .ico.
+# Safe to run on any host; skips formats whose tool is unavailable.
+icons:
+	@cd $(ICON_DIR) && bash build-icons.sh
 
 # ---------- Windows: embed icon via resource (optional — skip if .ico missing) ----------
 ifeq ($(PLATFORM),windows)
