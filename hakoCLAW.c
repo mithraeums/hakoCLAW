@@ -2836,9 +2836,13 @@ static void clPrintMascot(void) {
 
 /* Wall-clock millis since arbitrary epoch (used for turn duration). */
 static long clWallMs(void) {
+#ifdef _WIN32
+	return (long)GetTickCount64();
+#else
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
+#endif
 }
 
 /*** worker thread ***/
