@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hakoCLAW/releases"><img src="https://img.shields.io/badge/version-v0.1.4-b89656?style=flat-square&labelColor=14130f" alt="v0.1.4"/></a>
+  <a href="https://github.com/mithraeums/hakoCLAW/releases"><img src="https://img.shields.io/badge/version-v0.1.5-b89656?style=flat-square&labelColor=14130f" alt="v0.1.5"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
-  <img src="https://img.shields.io/badge/providers-13%2B-c8c2b2?style=flat-square&labelColor=14130f" alt="13+ providers"/>
+  <img src="https://img.shields.io/badge/providers-18%2B-c8c2b2?style=flat-square&labelColor=14130f" alt="18+ providers"/>
   <img src="https://img.shields.io/badge/platforms-5-c8c2b2?style=flat-square&labelColor=14130f" alt="5 platforms"/>
 </p>
 
@@ -23,7 +23,7 @@
 <br>
 
 ```
-    █       █     hakoCLAW v0.1.4
+    █       █     hakoCLAW v0.1.5
    ███     ███    provider: gemini
  ███████████████  model: gemini-2.5-flash
  ███░████████░██  trust: granted
@@ -44,7 +44,7 @@
 
 - **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
 - **13 providers, 3 wire formats.** Anthropic native (SSE), OpenAI function-calling, Ollama local. Aliases route Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, OpenRouter, xAI/Grok, custom over OpenAI-compat. `koi` slot reserved for [hakoAI](https://github.com/mithraeums/hakoAI).
-- **Trust-gated tools.** `read_file`, `list_dir`, `write_file` (with staging), `run_shell` (10s timeout). Untrusted dir = all tools refused. `/trust` once per project.
+- **Trust-gated tools.** `read_file`, `list_dir`, `write_file` (with staging), `run_shell` (10s timeout). Untrusted dir = all tools refused. `:trust` once per project.
 - **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
 - **Self-update.** `hakoc --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
 - **Streaming + spinners.** Anthropic SSE streams live tokens. 8 spinner styles × 12 thinking labels rotate per turn (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`).
@@ -87,9 +87,16 @@ Detects OS and arch, downloads the latest signed release, verifies the sha256 si
 
 ```sh
 hakoc                    # interactive REPL
-> /login gemini          # opens browser, prompts for free-tier key
-> /model gemini-2.5-flash
+> :login anthropic       # OAuth — uses your Claude Pro / Max subscription
 > what's in this directory?
+
+# or — free tier, no subscription:
+> :login github-models   # device flow, free for any GitHub account
+> :model gpt-4o-mini
+
+# or — paste an API key:
+> :login gemini          # opens browser, paste free-tier key
+> :model gemini-2.5-flash
 ```
 
 Or one-shot:
@@ -124,17 +131,21 @@ hakoc --update           # check + atomic-replace if newer
 
 *Bracketed paste enabled in raw mode — multi-line pastes batch-insert.*
 
-### Slash commands (inside prompt):
+### Commands (inside prompt):
+
+`:` is the primary prefix (vim / hako style). `/` works as a legacy alias.
 
 ```
-/help            /clear
-/login [<prov>]  /provider <name>   /model <id>      /models
-/history [local|global]
-/skills [reload]    /skill install <url>    /skill uninstall <name>
-/tools on|off       /trust [revoke]         /usage
-/sessions           /resume <id>            /session [new]
-/quit
+:help     :clear     :retry     :edit     :undo     :usage     :q
+:providers          :models      :provider <name>      :model <id>
+:login [<prov>]     :logout [<prov>]     :accounts
+:history [local|global]
+:skills [reload]    :skill install <url>     :skill uninstall <name>
+:tools on|off       :toolgate on|off     :toolmode native|react     :trust [revoke]
+:sessions           :resume <id>     :session [new]
 ```
+
+**TAB** completes commands and provider names after `:login` / `:provider` / `:logout`.
 
 <p align="center"><sub><b>—— IV ——</b></sub></p>
 
@@ -143,38 +154,63 @@ hakoc --update           # check + atomic-replace if newer
 ### Auth · Trust · State
 
 ```
-~/.hakoc/state              provider, model, api key (mode 0600)
+~/.hakoc/state              provider, model, settings (mode 0600, no secrets)
+~/.hakoc/credentials        per-provider api_key / oauth tokens (obfuscated, 0600)
 ~/.hakoc/history            append-only JSONL chat log
 ~/.hakoc/skills/            markdown behaviors (flat or dir-dispatcher)
 ~/.hakoc/input_history      line editor history (last 500)
 ~/.hakocrc                  user config
-<cwd>/.hakoc/state          per-project session id, turn count
+<cwd>/.hakoc/state          per-project session id, turn count (no secrets)
 <cwd>/.hakoc/trust          sentinel: tools allowed in this cwd
 ```
 
-Keys are read in this order: `CLAW_API_KEY` env → `<PROVIDER>_API_KEY` env → `~/.hakoc/state` → `~/.hakocrc`. `/login <provider>` opens the provider console in your browser, prompts with input hidden, persists 0600.
+**Three auth paths:**
+
+- **OAuth (subscription / account-bound)** — `:login anthropic` (Claude Pro/Max), `:login copilot` (GitHub Copilot Pro/Business), `:login github-models` (free for any GitHub user), `:login openrouter` (PKCE, auto-issue an OR API key). Inference bills against your subscription where applicable; no per-token API key needed.
+- **API-key paste** — `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
+- **Local** — `:login ollama` / `:login ollamacloud`. Local: ensure `ollama serve` is running. Cloud: paste an Ollama key.
+
+Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists installed local models on Ollama or curated suggestions per provider. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
+
+Resolution order: `CLAW_API_KEY` env → `<PROVIDER>_API_KEY` env → `~/.hakoc/credentials` (per provider).
 
 First run in any directory asks for trust. Untrusted = no tool access at all.
 
-### Provider/Model
+### Connection Matrix
 
-| Provider       | id (`/provider <id>`)    | Free tier      | Wire format       |
-|---             |---                       |---             |---                |
-| Anthropic      | `anthropic` · `claude`   | —              | native + SSE      |
-| OpenAI         | `openai` · `gpt`         | —              | function-calling  |
-| Ollama (local) | `ollama` · `local`       | ∞              | native            |
-| Gemini         | `gemini` · `google`      | ✓ generous     | OpenAI-compat     |
-| Groq           | `groq`                   | ✓ fastest      | OpenAI-compat     |
-| Cerebras       | `cerebras`               | ✓              | OpenAI-compat     |
-| OpenRouter     | `openrouter`             | `:free` models | OpenAI-compat     |
-| Mistral        | `mistral`                | rate-limited   | OpenAI-compat     |
-| DeepSeek       | `deepseek`               | —              | OpenAI-compat     |
-| Together       | `together`               | —              | OpenAI-compat     |
-| Fireworks      | `fireworks`              | —              | OpenAI-compat     |
-| xAI            | `xai` · `grok`           | —              | OpenAI-compat     |
-| custom         | `custom`                 | depends        | OpenAI-compat     |
+| Provider          | id (`:provider <id>`)            | Auth          | Cost     | Wire format       | Notes                                        |
+|---                |---                               |---            |---       |---                |---                                           |
+| Anthropic         | `anthropic` · `claude`           | OAuth         | sub      | native + SSE      | Claude Pro/Max subscription; live-tested     |
+| Anthropic API     | `anthropic-api` · `claude-api`   | paste         | $/tok    | native + SSE      | regular API key, separate from sub           |
+| GitHub Copilot    | `copilot` · `github-copilot`    | OAuth         | sub      | OpenAI-compat     | Copilot Pro/Business; device flow            |
+| GitHub Models     | `github-models` · `ghmodels`    | OAuth         | free     | OpenAI-compat     | rate-limited; any GH account                 |
+| OpenRouter        | `openrouter`                     | OAuth (PKCE)  | $/tok    | OpenAI-compat     | auto-issues user-scoped key; `:free` tier    |
+| OpenRouter API    | `openrouter-api`                 | paste         | $/tok    | OpenAI-compat     | paste existing key                           |
+| OpenAI            | `openai` · `gpt`                 | paste         | $/tok    | function-calling  |                                              |
+| Gemini            | `gemini` · `google`              | paste         | free/$   | OpenAI-compat     | generous free tier on AI Studio              |
+| Groq              | `groq`                           | paste         | free     | OpenAI-compat     | fastest hosting for Llama family             |
+| Cerebras          | `cerebras`                       | paste         | free     | OpenAI-compat     | ultra-fast inference                         |
+| DeepSeek          | `deepseek`                       | paste         | $/tok    |  OpenAI-compat    | DeepSeek-Chat / Reasoner                     |
+| Mistral           | `mistral`                        | paste         | $/tok    | OpenAI-compat     | Mistral Large / Small / Codestral            |
+| Together          | `together`                       | paste         | $/tok    | OpenAI-compat     | aggregator                                   |
+| Fireworks         | `fireworks`                      | paste         | $/tok    | OpenAI-compat     | aggregator                                   |
+| xAI               | `xai` · `grok`                   | paste         | $/tok    | OpenAI-compat     | Grok API at api.x.ai                         |
+| Ollama (local)    | `ollama` · `local`               | none          | local    | native            | needs `ollama serve` running                 |
+| Ollama Cloud      | `ollamacloud` · `ocloud`         | paste         | $/tok    | native            | ollama.com hosted                            |
+| custom            | `custom`                         | paste         | depends  | OpenAI-compat     | set `ai_endpoint` in `.hakocrc`              |
 
-*13 provider names; 3 wire formats (Anthropic, Ollama, OpenAI-compat). Quickest path with no card: `hakoc` → `/login gemini` → `/model gemini-2.5-flash`. Does **not** bypass paid subscriptions (Claude Pro, ChatGPT Plus) — those are first-party-client-only.*
+*Three wire formats (native Anthropic, native Ollama, OpenAI-compat).  Quickest paths: (a) **Claude Pro/Max** → `:login anthropic`. (b) **Copilot Pro** → `:login copilot`. (c) **Free, no card** → `:login github-models`, `:login gemini`, `:login groq`, or `:login ollama`. (d) **Pay-as-you-go** → any paste row. ChatGPT Plus piggyback deferred to v0.1.6.*
+
+### Tool modes
+
+Some smaller / non-tool-tuned models (Mistral 7B, Phi-4, DeepSeek-R1 distills, smaller Gemma / Llama variants) don't reliably emit OpenAI/Anthropic function-calling JSON. Toggle ReAct mode:
+
+```sh
+:toolmode react        # model emits <tool name="X">{...}</tool> blocks in prose
+:toolmode native       # back to native function-calling (default)
+```
+
+ReAct mode injects a tool schema in the system prompt and parses `<tool>...</tool>` blocks from the model's response. Each tool call is executed and the result is appended as `<observation tool="X">...</observation>` for the next turn. Works with any instruct-tuned model.
 
 <p align="center"><sub><b>—— V ——</b></sub></p>
 
@@ -206,9 +242,19 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### v0.1.4 (Latest)<br>
-- **`--pipe` mode** for hako integration — JSONL I/O over stdin/stdout. Hako spawns `hakoc --pipe` once per Rei pane and drives the agent without embedding it.
-- **Mithraeum palette by default** — gold / paper / rust / dim chalk truecolor. Matches the hako default theme + site banners + icon.
+### v0.1.5 (Latest)<br>
+- **4 OAuth providers** — `:login anthropic` (Claude Pro/Max), `:login copilot` (Copilot Pro), `:login github-models` (free for any GH user), `:login openrouter` (PKCE auto-issue).
+- **Discovery** — `:providers` grouped catalog, `:models` live (Ollama) or curated suggestions (other providers), TAB completion.
+- **Workflow parity** — `:retry`, `:edit`, `:undo`, up-arrow recall.
+- **ReAct tool fallback** — `:toolmode react` for smaller / non-tool-tuned models (Mistral 7B, Phi-4, DeepSeek-R1 distills).
+- **Cost tracking** — per-provider USD/M-token price table, session `$` in status line, `:usage reset`.
+- **Rendering** — tool category glyphs, fenced code blocks with bronze gutter, last-turn latency in status line.
+- **Per-provider cred store** — `~/.hakoc/credentials` (XOR + base64, 0600). `:accounts`, `:logout`.
+- **Mid-chat provider swap** — `:provider X` flattens wire-format-specific bodies so conversation survives Anthropic↔OpenAI↔Ollama jumps.
+
+### v0.1.4<br>
+- **`--pipe` mode** for hako integration — JSONL I/O over stdin/stdout.
+- **Mithraeum palette by default** — gold / paper / rust / dim chalk truecolor.
 
 See [CHANGELOG.md](CHANGELOG.md) for full history.
 

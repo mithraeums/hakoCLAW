@@ -24,7 +24,12 @@
  */
 
 /*** includes ***/
-#define CLAW_VERSION "0.1.4"
+#define CLAW_VERSION "0.1.5"
+
+/* GitHub Copilot OAuth + API constants. Public client_id from VS Code Copilot extension.
+   Defined here so hkBuildCurlCmd (earlier in file) can reference the Editor-* headers. */
+#define CLAW_COPILOT_EDITOR_VER   "vscode/1.95.0"
+#define CLAW_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
 #define CLAW_REPO    "mithraeums/hakoCLAW"
 
 #include <ctype.h>
@@ -194,6 +199,8 @@ typedef struct aiData {
 	int last_out_tokens;
 	long total_in_tokens;
 	long total_out_tokens;
+	long last_turn_ms;
+	long turn_start_ms;
 } aiData;
 
 struct clConfig {
@@ -204,6 +211,8 @@ struct clConfig {
 	int ai_temperature;
 	int ai_max_tokens;
 	int ai_tools_enabled;
+	int ai_tool_gate;       /* 1 = drop tools when last user msg lacks tool-keyword */
+	int ai_toolmode;        /* 0 = native function-calling, 1 = ReAct (pseudo-XML in prose) */
 	int ai_stream;
 	int ai_autowrite;
 
@@ -223,6 +232,12 @@ struct clConfig {
 	int debug;
 	int compact;           /* --compact: skip figlet + framed box on banner */
 	int pipe_mode;         /* --pipe: JSONL I/O with hako editor (no REPL UI) */
+	unsigned char last_role_shown; /* tracks last role rendered for turn separator */
+
+	/* OAuth (device-flow). When ai_oauth_refresh non-NULL, ai_api_key holds access_token. */
+	char *ai_oauth_provider;       /* "gemini" | "github-models" | NULL */
+	char *ai_oauth_refresh;        /* refresh_token */
+	long  ai_oauth_expires_at;     /* unix epoch when access_token expires */
 };
 
 struct clConfig E;
@@ -334,6 +349,8 @@ static const char *CL_DEFAULT_MASCOT[] = {
 static void aiAddHistory(aiData *data, const char *text);
 static void aiAddHistoryRole(aiData *data, const char *text, unsigned char role);
 static void aiPushMessage(aiData *data, const char *role, const char *content);
+static void aiFlattenMessages(aiData *data);
+static char *aiExtractStringValue(const char *p);
 static void aiPushMessageRaw(aiData *data, const char *role, const char *content_json);
 static void aiPushMessageBody(aiData *data, const char *role, const char *body_fields);
 static void aiFreeMessages(aiData *data);
@@ -361,11 +378,26 @@ static int hkExtractJsonInt(const char *src, const char *key);
 static char *hkExtractJsonObject(const char *src, const char *key);
 static void hkUpdateUsage(aiData *data, const char *resp);
 static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type);
+static int clOAuthAnthropic(aiData *data);
+static int clOAuthGithubCopilot(aiData *data);
+static int clOAuthCopilotExchange(aiData *data);
+static int clOAuthGithubModels(aiData *data);
+static int clOAuthOpenRouter(aiData *data);
+static int clOAuthRefresh(aiData *data);
+static void clOAuthEnsureFresh(aiData *data);
+static char *clOAuthRandomVerifier(void);
+static int clOAuthLoopbackListen(int *out_port);
+static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec);
+static void clUrlEncodeInto(const char *s, char *out, size_t cap);
+
+/* Set by /edit slash. Pre-fills the next clReadLineRaw buffer + cursor at end. */
+static char *cl_preset_input = NULL;
 static char *aiExtractResponse(const char *json, enum aiProviderType type);
 static char *hkExecTool(const char *name, const char *input_json);
 static char *hkExtractContentArray(const char *response);
 static char *hkBuildToolResults(aiData *data, const char *content_array);
 static int hkFnToolExecAll(aiData *data, const char *response);
+static int hkReactToolExecAll(aiData *data, const char *content);
 static void clStartAnim(aiData *data);
 static void clStopAnim(aiData *data);
 static void clLoadMascot(const char *path);
@@ -409,31 +441,46 @@ static char *hkJsonUnescape(const char *s, int len) {
 }
 
 static char *hkExtractJsonString(const char *src, const char *key) {
+	/* Match `"key"` followed by optional whitespace, `:`, optional whitespace, `"`.
+	   Some providers (Anthropic OAuth token endpoint) pretty-print with spaces. */
 	char pat[64];
-	snprintf(pat, sizeof(pat), "\"%s\":\"", key);
-	const char *p = strstr(src, pat);
-	if (!p) return NULL;
-	p += strlen(pat);
-	const char *end = p;
-	while (*end && !(*end == '"' && *(end - 1) != '\\')) end++;
-	if (!*end) return NULL;
-	int len = end - p;
-	char *out = malloc(len + 1);
-	memcpy(out, p, len);
-	out[len] = '\0';
-	return out;
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	const char *p = src;
+	while ((p = strstr(p, pat)) != NULL) {
+		const char *q = p + strlen(pat);
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != ':') { p++; continue; }
+		q++;
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != '"') { p++; continue; }
+		q++;
+		const char *end = q;
+		while (*end && !(*end == '"' && *(end - 1) != '\\')) end++;
+		if (!*end) return NULL;
+		int len = (int)(end - q);
+		char *out = malloc(len + 1);
+		memcpy(out, q, len);
+		out[len] = '\0';
+		return out;
+	}
+	return NULL;
 }
 
 static int hkExtractJsonInt(const char *src, const char *key) {
 	if (!src) return -1;
 	char pat[64];
-	snprintf(pat, sizeof(pat), "\"%s\":", key);
-	const char *p = strstr(src, pat);
-	if (!p) return -1;
-	p += strlen(pat);
-	while (*p == ' ') p++;
-	if (*p < '0' || *p > '9') return -1;
-	return atoi(p);
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	const char *p = src;
+	while ((p = strstr(p, pat)) != NULL) {
+		const char *q = p + strlen(pat);
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != ':') { p++; continue; }
+		q++;
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q < '0' || *q > '9') { p++; continue; }
+		return atoi(q);
+	}
+	return -1;
 }
 
 static char *hkExtractJsonObject(const char *src, const char *key) {
@@ -460,6 +507,65 @@ static char *hkExtractJsonObject(const char *src, const char *key) {
 	memcpy(out, start, len);
 	out[len] = '\0';
 	return out;
+}
+
+/* USD per million tokens, (input, output). Model match is substring of E.ai_model.
+   Updated 2026-05; coarse — pricing drifts and provider tiers shift. Order matters: longer
+   substrings first so e.g. "claude-haiku" wins over "claude". */
+static int hkModelPriceUSDperM(const char *model, double *in_p, double *out_p) {
+	if (!model || !*model) return 0;
+	struct { const char *m; double in; double out; } table[] = {
+		{ "claude-opus-4",    15.0,  75.0 },
+		{ "claude-sonnet-4",   3.0,  15.0 },
+		{ "claude-haiku-4",    1.0,   5.0 },
+		{ "claude-3-5-sonnet", 3.0,  15.0 },
+		{ "claude-3-5-haiku",  1.0,   5.0 },
+		{ "claude-3-opus",    15.0,  75.0 },
+		{ "claude",            3.0,  15.0 },  /* fallback Anthropic */
+		{ "gpt-4o-mini",       0.15,  0.60 },
+		{ "gpt-4o",            2.50, 10.0 },
+		{ "gpt-4.1",           2.0,   8.0 },
+		{ "gpt-4",            30.0,  60.0 },
+		{ "o1-mini",           3.0,  12.0 },
+		{ "o1",               15.0,  60.0 },
+		{ "gemini-1.5-pro",    1.25,  5.0 },
+		{ "gemini-2.5-pro",    1.25,  5.0 },
+		{ "gemini-2.5-flash",  0.075, 0.30 },
+		{ "gemini-1.5-flash",  0.075, 0.30 },
+		{ "gemini",            0.075, 0.30 },
+		{ "deepseek-chat",     0.27,  1.10 },
+		{ "deepseek",          0.27,  1.10 },
+		{ "mistral-large",     2.0,   6.0 },
+		{ "grok",              5.0,  15.0 },
+	};
+	for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+		if (strstr(model, table[i].m)) { *in_p = table[i].in; *out_p = table[i].out; return 1; }
+	}
+	return 0;
+}
+
+/* Returns 0 when on a flat-rate subscription (e.g. /login anthropic OAuth) or free tier.
+   Returns -1 when the model has no price entry. */
+static double hkSessionCostUSD(aiData *data) {
+	if (!data) return 0.0;
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic")) return 0.0;
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) return 0.0;
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) return 0.0;
+	if (E.ai_provider_type == AI_PROVIDER_OLLAMA) return 0.0;  /* local + ollamacloud free-tier-ish */
+	double ip = 0, op = 0;
+	if (!hkModelPriceUSDperM(E.ai_model, &ip, &op)) return -1.0;
+	return ((double)data->total_in_tokens * ip + (double)data->total_out_tokens * op) / 1e6;
+}
+
+/* Free-tier / sub label for status line. Returns NULL when not flat-rate. */
+static const char *hkFreeTierLabel(void) {
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))      return "sub";
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) return "sub";
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) return "free";
+	if (E.ai_provider_type == AI_PROVIDER_OLLAMA && E.ai_endpoint &&
+		(strstr(E.ai_endpoint, "localhost") || strstr(E.ai_endpoint, "127.0.0.1"))) return "local";
+	if (E.ai_provider_type == AI_PROVIDER_OLLAMA) return "ollama";
+	return NULL;
 }
 
 static void hkUpdateUsage(aiData *data, const char *resp) {
@@ -655,7 +761,9 @@ static const char *hkProviderName(enum aiProviderType t) {
 }
 
 static enum aiProviderType hkParseProvider(const char *s) {
-	if (strcmp(s, "ollama") == 0 || strcmp(s, "local") == 0) return AI_PROVIDER_OLLAMA;
+	if (strcmp(s, "ollama") == 0 || strcmp(s, "local") == 0
+		|| strcmp(s, "ollamacloud") == 0 || strcmp(s, "ocloud") == 0
+		|| strcmp(s, "ollama-cloud") == 0) return AI_PROVIDER_OLLAMA;
 	if (strcmp(s, "anthropic") == 0 || strcmp(s, "claude") == 0) return AI_PROVIDER_ANTHROPIC;
 	if (strcmp(s, "openai") == 0 || strcmp(s, "gpt") == 0 || strcmp(s, "groq") == 0) return AI_PROVIDER_OPENAI;
 	if (strcmp(s, "deepseek") == 0 || strcmp(s, "mistral") == 0 || strcmp(s, "together") == 0
@@ -663,6 +771,8 @@ static enum aiProviderType hkParseProvider(const char *s) {
 		|| strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0
 		|| strcmp(s, "gemini") == 0 || strcmp(s, "google") == 0
 		|| strcmp(s, "cerebras") == 0
+		|| strcmp(s, "github-copilot") == 0 || strcmp(s, "copilot") == 0
+		|| strcmp(s, "github-models") == 0 || strcmp(s, "ghmodels") == 0
 		|| strcmp(s, "custom") == 0) return AI_PROVIDER_OPENAI;
 	/* future: koi (local hakoAI model) */
 	if (strcmp(s, "koi") == 0) return AI_PROVIDER_OLLAMA;  /* placeholder until engine ready */
@@ -672,6 +782,8 @@ static enum aiProviderType hkParseProvider(const char *s) {
 static const char *hkProviderDefaultEndpoint(const char *s) {
 	if (strcmp(s, "ollama") == 0 || strcmp(s, "local") == 0 || strcmp(s, "koi") == 0)
 		return "http://localhost:11434";
+	if (strcmp(s, "ollamacloud") == 0 || strcmp(s, "ocloud") == 0 || strcmp(s, "ollama-cloud") == 0)
+		return "https://ollama.com";
 	if (strcmp(s, "deepseek") == 0)   return "https://api.deepseek.com";
 	if (strcmp(s, "mistral") == 0)    return "https://api.mistral.ai";
 	if (strcmp(s, "together") == 0)   return "https://api.together.xyz";
@@ -681,6 +793,10 @@ static const char *hkProviderDefaultEndpoint(const char *s) {
 	if (strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0) return "https://api.x.ai";
 	if (strcmp(s, "gemini") == 0 || strcmp(s, "google") == 0) return "https://generativelanguage.googleapis.com/v1beta/openai";
 	if (strcmp(s, "cerebras") == 0)   return "https://api.cerebras.ai";
+	if (strcmp(s, "github-copilot") == 0 || strcmp(s, "copilot") == 0)
+		return "https://api.githubcopilot.com";
+	if (strcmp(s, "github-models") == 0 || strcmp(s, "ghmodels") == 0)
+		return "https://models.inference.ai.azure.com";
 	return NULL;
 }
 
@@ -708,6 +824,8 @@ static const char *clProviderConsoleUrl(const char *name) {
 	if (!strcmp(name, "xai") || !strcmp(name, "grok")) return "https://console.x.ai/";
 	if (!strcmp(name, "gemini") || !strcmp(name, "google")) return "https://aistudio.google.com/apikey";
 	if (!strcmp(name, "cerebras")) return "https://cloud.cerebras.ai/?tab=api-keys";
+	if (!strcmp(name, "ollamacloud") || !strcmp(name, "ocloud") || !strcmp(name, "ollama-cloud"))
+		return "https://ollama.com/settings/keys";
 	return NULL;
 }
 
@@ -780,11 +898,273 @@ static void clApplyEnv(void) {
 	clEnvApplyOpenAIKey("OPENROUTER_API_KEY");
 	clEnvApplyOpenAIKey("XAI_API_KEY");
 
+	/* Ollama cloud bearer key (provider type OLLAMA, not OpenAI-format). */
+	if ((k = getenv("OLLAMA_API_KEY")) && *k && E.ai_provider_type == AI_PROVIDER_OLLAMA) {
+		free(E.ai_api_key); E.ai_api_key = strdup(k);
+	}
+
 	/* CLAW_* always wins. */
 	if ((k = getenv("CLAW_API_KEY")) && *k) { free(E.ai_api_key); E.ai_api_key = strdup(k); }
 	if ((k = getenv("CLAW_PROVIDER")) && *k) hkApplyProviderAlias(k);
 	if ((k = getenv("CLAW_MODEL")) && *k) { free(E.ai_model); E.ai_model = strdup(k); }
 	if ((k = getenv("CLAW_ENDPOINT")) && *k) { free(E.ai_endpoint); E.ai_endpoint = strdup(k); }
+}
+
+/*** credential store ***/
+/* Per-provider obfuscated INI at ~/.hakoc/credentials. XOR-folded with a 32-byte
+   key derived from hostname+uid+salt, then base64'd per-line. Mode 0600.
+   Not encryption — defeats `cat`/`grep` and stops a copied file from leaking on
+   another machine. For real secrecy use platform keychain (out of scope here). */
+
+#define CL_CREDS_MAGIC "CLAWCREDv1"
+#define CL_PROV_MAX 32
+
+typedef struct clCred {
+	char provider[32];
+	char *api_key;
+	char *oauth_refresh;
+	long  oauth_expires_at;
+} clCred;
+
+static clCred cl_creds[CL_PROV_MAX];
+static int cl_creds_n = 0;
+static int cl_creds_loaded = 0;
+
+static void clCredsKey(unsigned char out[32]) {
+	char host[256] = "host";
+	gethostname(host, sizeof(host)-1); host[sizeof(host)-1] = '\0';
+	unsigned long uid = (unsigned long)
+#ifndef _WIN32
+		getuid();
+#else
+		0xC0FFEEUL;
+#endif
+	const char *salt = "hakoCLAW/credentials/v1";
+	/* FNV-1a 32-byte rolling hash. */
+	unsigned long h = 0xcbf29ce484222325UL;
+	for (int i = 0; i < 32; i++) out[i] = 0;
+	int oi = 0;
+	const char *parts[3] = {host, salt, NULL};
+	char uidbuf[32]; snprintf(uidbuf, sizeof(uidbuf), "%lu", uid);
+	parts[2] = uidbuf;
+	for (int round = 0; round < 4; round++) {
+		for (int p = 0; p < 3; p++) {
+			const char *s = parts[p];
+			for (int i = 0; s[i]; i++) {
+				h ^= (unsigned char)s[i];
+				h *= 0x100000001b3UL;
+				out[oi % 32] ^= (unsigned char)(h >> ((oi % 8) * 8));
+				oi++;
+			}
+		}
+	}
+}
+
+static void clXorBuf(unsigned char *buf, size_t len, const unsigned char key[32]) {
+	for (size_t i = 0; i < len; i++) buf[i] ^= key[i % 32];
+}
+
+static const char b64tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *clB64Encode(const unsigned char *in, size_t inlen) {
+	size_t outlen = ((inlen + 2) / 3) * 4;
+	char *out = malloc(outlen + 1);
+	if (!out) return NULL;
+	size_t i = 0, o = 0;
+	while (i + 3 <= inlen) {
+		unsigned v = (in[i] << 16) | (in[i+1] << 8) | in[i+2];
+		out[o++] = b64tab[(v >> 18) & 63];
+		out[o++] = b64tab[(v >> 12) & 63];
+		out[o++] = b64tab[(v >> 6) & 63];
+		out[o++] = b64tab[v & 63];
+		i += 3;
+	}
+	if (i < inlen) {
+		unsigned v = in[i] << 16;
+		if (i + 1 < inlen) v |= in[i+1] << 8;
+		out[o++] = b64tab[(v >> 18) & 63];
+		out[o++] = b64tab[(v >> 12) & 63];
+		out[o++] = (i + 1 < inlen) ? b64tab[(v >> 6) & 63] : '=';
+		out[o++] = '=';
+	}
+	out[o] = '\0';
+	return out;
+}
+
+static unsigned char *clB64Decode(const char *in, size_t *outlen) {
+	static signed char rev[256];
+	static int rev_init = 0;
+	if (!rev_init) {
+		for (int i = 0; i < 256; i++) rev[i] = -1;
+		for (int i = 0; i < 64; i++) rev[(int)b64tab[i]] = (signed char)i;
+		rev_init = 1;
+	}
+	size_t inlen = strlen(in);
+	unsigned char *out = malloc(inlen);
+	if (!out) return NULL;
+	size_t o = 0;
+	unsigned v = 0;
+	int bits = 0;
+	for (size_t i = 0; i < inlen; i++) {
+		unsigned char c = (unsigned char)in[i];
+		if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+		int d = rev[c];
+		if (d < 0) { free(out); return NULL; }
+		v = (v << 6) | d;
+		bits += 6;
+		if (bits >= 8) { bits -= 8; out[o++] = (v >> bits) & 0xff; }
+	}
+	*outlen = o;
+	return out;
+}
+
+static void clCredsPath(char *out, size_t cap) {
+	char dir[512]; hkClawDirPath(dir, sizeof(dir));
+	if (dir[0]) snprintf(out, cap, "%s/credentials", dir);
+	else out[0] = '\0';
+}
+
+static clCred *clCredsFind(const char *provider) {
+	if (!provider) return NULL;
+	for (int i = 0; i < cl_creds_n; i++)
+		if (strcmp(cl_creds[i].provider, provider) == 0) return &cl_creds[i];
+	return NULL;
+}
+
+static clCred *clCredsUpsert(const char *provider) {
+	clCred *c = clCredsFind(provider);
+	if (c) return c;
+	if (cl_creds_n >= CL_PROV_MAX) return NULL;
+	c = &cl_creds[cl_creds_n++];
+	memset(c, 0, sizeof(*c));
+	snprintf(c->provider, sizeof(c->provider), "%s", provider);
+	return c;
+}
+
+static void clCredsSave(void) {
+	char path[640]; clCredsPath(path, sizeof(path));
+	if (!path[0]) return;
+	/* Serialize plaintext. */
+	size_t cap = 4096, len = 0;
+	char *plain = malloc(cap);
+	if (!plain) return;
+	for (int i = 0; i < cl_creds_n; i++) {
+		clCred *c = &cl_creds[i];
+		if (!c->api_key && !c->oauth_refresh) continue;
+		size_t need = len + 256
+			+ (c->api_key ? strlen(c->api_key) : 0)
+			+ (c->oauth_refresh ? strlen(c->oauth_refresh) : 0);
+		if (need >= cap) { while (cap < need) cap *= 2; plain = realloc(plain, cap); }
+		len += snprintf(plain + len, cap - len, "[%s]\n", c->provider);
+		if (c->api_key) len += snprintf(plain + len, cap - len, "api_key=%s\n", c->api_key);
+		if (c->oauth_refresh) len += snprintf(plain + len, cap - len, "oauth_refresh=%s\n", c->oauth_refresh);
+		if (c->oauth_expires_at) len += snprintf(plain + len, cap - len, "oauth_expires_at=%ld\n", c->oauth_expires_at);
+		if (len + 1 < cap) plain[len++] = '\n';
+	}
+	unsigned char key[32]; clCredsKey(key);
+	clXorBuf((unsigned char *)plain, len, key);
+	char *b64 = clB64Encode((unsigned char *)plain, len);
+	free(plain);
+	if (!b64) return;
+	FILE *fp = fopen(path, "w");
+	if (!fp) { free(b64); return; }
+	fprintf(fp, "%s\n", CL_CREDS_MAGIC);
+	/* Line-wrap base64 at 72 cols for human-eye sanity. */
+	size_t blen = strlen(b64);
+	for (size_t i = 0; i < blen; i += 72) {
+		size_t n = blen - i; if (n > 72) n = 72;
+		fwrite(b64 + i, 1, n, fp);
+		fputc('\n', fp);
+	}
+	fclose(fp);
+	free(b64);
+#ifndef _WIN32
+	chmod(path, 0600);
+#endif
+}
+
+static void clCredsLoad(void) {
+	if (cl_creds_loaded) return;
+	cl_creds_loaded = 1;
+	char path[640]; clCredsPath(path, sizeof(path));
+	if (!path[0]) return;
+	FILE *fp = fopen(path, "r");
+	if (!fp) return;
+	char header[64];
+	if (!fgets(header, sizeof(header), fp)) { fclose(fp); return; }
+	if (strncmp(header, CL_CREDS_MAGIC, strlen(CL_CREDS_MAGIC)) != 0) { fclose(fp); return; }
+	/* Read remaining as base64 blob. */
+	size_t cap = 4096, len = 0;
+	char *b64 = malloc(cap);
+	int ch;
+	while ((ch = fgetc(fp)) != EOF) {
+		if (len + 1 >= cap) { cap *= 2; b64 = realloc(b64, cap); }
+		if (ch != '\n' && ch != '\r') b64[len++] = (char)ch;
+	}
+	b64[len] = '\0';
+	fclose(fp);
+	size_t plain_len = 0;
+	unsigned char *plain = clB64Decode(b64, &plain_len);
+	free(b64);
+	if (!plain) return;
+	unsigned char key[32]; clCredsKey(key);
+	clXorBuf(plain, plain_len, key);
+	/* Parse INI. */
+	char *cur = (char *)plain;
+	char *endp = (char *)plain + plain_len;
+	clCred *active = NULL;
+	while (cur < endp) {
+		char *eol = memchr(cur, '\n', endp - cur);
+		if (!eol) eol = endp;
+		*eol = '\0';
+		char *line = cur;
+		cur = eol + 1;
+		if (!*line) continue;
+		if (*line == '[') {
+			char *rb = strchr(line, ']');
+			if (rb) {
+				*rb = '\0';
+				active = clCredsUpsert(line + 1);
+			}
+			continue;
+		}
+		if (!active) continue;
+		char *eq = strchr(line, '='); if (!eq) continue;
+		*eq = '\0';
+		char *val = eq + 1;
+		if (!strcmp(line, "api_key"))            { free(active->api_key); active->api_key = strdup(val); }
+		else if (!strcmp(line, "oauth_refresh")) { free(active->oauth_refresh); active->oauth_refresh = strdup(val); }
+		else if (!strcmp(line, "oauth_expires_at")) active->oauth_expires_at = atol(val);
+	}
+	free(plain);
+}
+
+/* Snapshot E's current secrets into the cred map under the current provider name. */
+static void clCredsCaptureCurrent(void) {
+	const char *name = hkProviderName(E.ai_provider_type);
+	if (!name || !strcmp(name, "none")) return;
+	clCred *c = clCredsUpsert(name);
+	if (!c) return;
+	free(c->api_key); c->api_key = E.ai_api_key ? strdup(E.ai_api_key) : NULL;
+	free(c->oauth_refresh); c->oauth_refresh = E.ai_oauth_refresh ? strdup(E.ai_oauth_refresh) : NULL;
+	c->oauth_expires_at = E.ai_oauth_expires_at;
+}
+
+/* Populate E's secrets from cred map for the given provider. */
+static void clCredsRestoreFor(const char *provider) {
+	if (!provider) return;
+	clCred *c = clCredsFind(provider);
+	free(E.ai_api_key); E.ai_api_key = NULL;
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+	E.ai_oauth_expires_at = 0;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = NULL;
+	if (!c) return;
+	if (c->api_key) E.ai_api_key = strdup(c->api_key);
+	if (c->oauth_refresh) {
+		E.ai_oauth_refresh = strdup(c->oauth_refresh);
+		E.ai_oauth_provider = strdup(provider);
+	}
+	E.ai_oauth_expires_at = c->oauth_expires_at;
 }
 
 /*** session/state ***/
@@ -794,8 +1174,10 @@ static void hkWriteSessionFile(const char *path, int include_secrets) {
 	fprintf(fp, "ai_provider=%s\n", hkProviderName(E.ai_provider_type));
 	if (E.ai_model) fprintf(fp, "ai_model=%s\n", E.ai_model);
 	if (include_secrets && E.ai_endpoint) fprintf(fp, "ai_endpoint=%s\n", E.ai_endpoint);
-	if (include_secrets && E.ai_api_key)  fprintf(fp, "ai_api_key=%s\n", E.ai_api_key);
+	/* api_key + oauth_* live in ~/.hakoc/credentials (obfuscated), no longer in state. */
 	fprintf(fp, "ai_tools_enabled=%d\n", E.ai_tools_enabled);
+	fprintf(fp, "ai_tool_gate=%d\n", E.ai_tool_gate);
+	fprintf(fp, "ai_toolmode=%d\n", E.ai_toolmode);
 	fprintf(fp, "ai_stream=%d\n", E.ai_stream);
 	fprintf(fp, "ai_autowrite=%d\n", E.ai_autowrite);
 	if (E.session_id) fprintf(fp, "session_id=%s\n", E.session_id);
@@ -850,8 +1232,20 @@ static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 		} else if (strcmp(key, "ai_api_key") == 0) {
 			free(E.ai_api_key);
 			E.ai_api_key = strdup(val);
+		} else if (strcmp(key, "ai_oauth_provider") == 0) {
+			free(E.ai_oauth_provider);
+			E.ai_oauth_provider = strdup(val);
+		} else if (strcmp(key, "ai_oauth_refresh") == 0) {
+			free(E.ai_oauth_refresh);
+			E.ai_oauth_refresh = strdup(val);
+		} else if (strcmp(key, "ai_oauth_expires_at") == 0) {
+			E.ai_oauth_expires_at = atol(val);
 		} else if (strcmp(key, "ai_tools_enabled") == 0) {
 			E.ai_tools_enabled = atoi(val) ? 1 : 0;
+		} else if (strcmp(key, "ai_tool_gate") == 0) {
+			E.ai_tool_gate = atoi(val) ? 1 : 0;
+		} else if (strcmp(key, "ai_toolmode") == 0) {
+			E.ai_toolmode = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_stream") == 0) {
 			E.ai_stream = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_autowrite") == 0) {
@@ -1146,34 +1540,63 @@ static int hkLoadSkills(aiData *data) {
 	closedir(d);
 	if (buf) buf[total] = '\0';
 
+	/* ReAct mode prepends a pseudo-XML tool schema for models that don't natively
+	   emit OpenAI/Anthropic function-calling JSON. Loop in worker thread scans
+	   responses for <tool>...</tool> blocks and appends <observation>...</observation>
+	   as user turns. Toggle via /toolmode react. */
+	static const char *REACT_PROMPT =
+		"You can use these tools. To call a tool, emit EXACTLY this in your response:\n"
+		"\n"
+		"<tool name=\"TOOL_NAME\">\n"
+		"{\"arg1\": \"value1\", \"arg2\": \"value2\"}\n"
+		"</tool>\n"
+		"\n"
+		"Stop right after the </tool> tag and wait. The system will reply with:\n"
+		"<observation>...result...</observation>\n"
+		"Then continue. You may chain multiple tools.\n"
+		"\n"
+		"Tools:\n"
+		"  read_file(path: string)        Read a file. Path relative to project.\n"
+		"  list_dir(path: string)         List directory entries. Use \".\" for project root.\n"
+		"  write_file(path, content)      Create/overwrite a file. Needs trust.\n"
+		"  run_shell(cmd: string)         Run non-interactive shell command. Needs trust. 10s.\n"
+		"  read_skill(skill, path)        Read a file inside an installed skill.\n"
+		"\n"
+		"For the final answer to the user, respond in plain text WITHOUT any <tool> tags.\n"
+		"\n";
+
 	/* Prepend tool-use guidance. Small models (llama3.2, qwen2.5-small) tend to
 	   invoke tools on greetings / chit-chat without it. Anthropic-tuned models
 	   are mostly fine but the extra line is cheap. */
 	static const char *BASE_PROMPT =
 		"You are hakoCLAW, a terminal AI agent.\n"
 		"\n"
-		"TOOL POLICY — read carefully.\n"
-		"Tools are OPT-IN. Default behavior is plain text. Do NOT call any tool unless the user has explicitly asked you to read, list, write, or run something in the current project directory.\n"
+		"RULE 1: Do NOT call any tool unless the user explicitly asks to read, list, write, or run something. Greetings, questions, and explanations get a plain text reply with ZERO tool calls.\n"
 		"\n"
-		"Examples of when to call tools:\n"
-		"  user: \"read README.md\"            -> call read_file(path=\"README.md\")\n"
-		"  user: \"what's in this folder?\"    -> call list_dir(path=\".\")\n"
-		"  user: \"create test.txt with hi\"  -> call write_file(path=\"test.txt\", content=\"hi\\n\")\n"
+		"RULE 2: All paths are RELATIVE to the current project. Use \".\" for the project root. NEVER use absolute paths like /home/..., /Users/..., /root/..., /tmp/.... Those paths do NOT exist here and every call will fail.\n"
 		"\n"
-		"Examples of when to NOT call tools:\n"
-		"  user: \"hello\"                     -> reply in text. NO tools.\n"
-		"  user: \"who are you?\"              -> reply in text. NO tools.\n"
-		"  user: \"explain X\"                 -> reply in text. NO tools.\n"
+		"Examples — call tools:\n"
+		"  user: \"read README.md\"           -> read_file(path=\"README.md\")\n"
+		"  user: \"what files are here?\"     -> list_dir(path=\".\")\n"
+		"  user: \"create test.txt with hi\" -> write_file(path=\"test.txt\", content=\"hi\\n\")\n"
 		"\n"
-		"NEVER invent paths. Use only paths the user provided or that exist in the current project. Do NOT call list_dir(\"/home/user/project\") or any other placeholder path — that path does not exist on this machine.\n"
-		"When the user has not asked for a file operation, your response must be a normal text reply with zero tool calls.\n";
+		"Examples — do NOT call tools:\n"
+		"  user: \"hello\"                     -> plain text reply\n"
+		"  user: \"who are you?\"              -> plain text reply\n"
+		"  user: \"explain recursion\"         -> plain text reply\n"
+		"  user: \"what is 2+2?\"              -> plain text reply\n"
+		"\n"
+		"If a tool returns \"error: path outside project\", do NOT retry with another absolute path. Either use \".\" or stop and reply in text.\n";
 	size_t blen = strlen(BASE_PROMPT);
-	size_t need = blen + total + 1;
+	size_t rlen = (E.ai_toolmode == 1) ? strlen(REACT_PROMPT) : 0;
+	size_t need = rlen + blen + total + 1;
 	char *combined = malloc(need);
 	if (combined) {
-		memcpy(combined, BASE_PROMPT, blen);
-		if (buf && total > 0) memcpy(combined + blen, buf, total);
-		combined[blen + total] = '\0';
+		size_t off = 0;
+		if (rlen > 0) { memcpy(combined + off, REACT_PROMPT, rlen); off += rlen; }
+		memcpy(combined + off, BASE_PROMPT, blen); off += blen;
+		if (buf && total > 0) { memcpy(combined + off, buf, total); off += total; }
+		combined[off] = '\0';
 		free(buf);
 		free(data->system_prompt);
 		data->system_prompt = combined;
@@ -1220,6 +1643,62 @@ static void clPipeEmitRaw(const char *json) {
 }
 
 /*** history (CLI render) — aiAddHistory variants print + store ***/
+/* Render a single line of markdown into ANSI. Patterns:
+   **bold**, *italic* / _italic_, `code`, leading "# " / "## " / "### " = heading,
+   leading "> " = block-quote, leading "- " / "* " = bullet (left-pad arrow). */
+static void clRenderMarkdownInline(const char *in, char *out, size_t cap) {
+	size_t j = 0;
+	const char *p = in;
+	/* Headings */
+	if (p[0] == '#' && (p[1] == ' ' || (p[1] == '#' && (p[2] == ' ' || (p[2] == '#' && p[3] == ' '))))) {
+		int level = 1;
+		while (*p == '#') { level++; p++; }
+		if (*p == ' ') p++;
+		j += snprintf(out + j, cap - j, "\x1b[1m");
+		(void)level;
+	}
+	/* Block quote */
+	else if (p[0] == '>' && p[1] == ' ') {
+		j += snprintf(out + j, cap - j, "%s│ ", ANSI_DIM);
+		p += 2;
+	}
+	/* Bullet */
+	else if ((p[0] == '-' || p[0] == '*') && p[1] == ' ') {
+		j += snprintf(out + j, cap - j, "%s· %s", ANSI_TOOL, ANSI_RESET);
+		p += 2;
+	}
+	while (*p && j + 16 < cap) {
+		if (p[0] == '*' && p[1] == '*') {
+			const char *end = strstr(p + 2, "**");
+			if (end) {
+				j += snprintf(out + j, cap - j, "\x1b[1m%.*s\x1b[22m", (int)(end - p - 2), p + 2);
+				p = end + 2; continue;
+			}
+		}
+		if ((p[0] == '*' || p[0] == '_') && p[1] && p[1] != ' ' && p[1] != *p) {
+			char delim = p[0];
+			const char *end = strchr(p + 1, delim);
+			if (end && end > p + 1 && end[-1] != ' ') {
+				j += snprintf(out + j, cap - j, "\x1b[3m%.*s\x1b[23m", (int)(end - p - 1), p + 1);
+				p = end + 1; continue;
+			}
+		}
+		if (p[0] == '`') {
+			const char *end = strchr(p + 1, '`');
+			if (end) {
+				j += snprintf(out + j, cap - j, "%s%.*s%s", ANSI_TOOL, (int)(end - p - 1), p + 1, ANSI_RESET);
+				p = end + 1; continue;
+			}
+		}
+		out[j++] = *p++;
+	}
+	out[j] = '\0';
+}
+
+/* Cross-line state for fenced code blocks. AI text arrives as individual history
+   entries (one per line), so we need a sticky flag between calls to clPrintRoleLine. */
+static int cl_in_codefence = 0;
+
 static void clPrintRoleLine(unsigned char role, const char *text) {
 	if (E.pipe_mode) {
 		const char *rname = (role == HK_ROLE_USER) ? "user" :
@@ -1231,11 +1710,54 @@ static void clPrintRoleLine(unsigned char role, const char *text) {
 	switch (role) {
 	case HK_ROLE_USER: prefix = "▌ "; color = ANSI_USER; break;
 	case HK_ROLE_AI:   prefix = "▌ "; color = ANSI_AI; break;
-	default:           prefix = "  "; color = ANSI_SYS; break;
+	default:
+		if (text && (!strncmp(text, "Error", 5) || !strncmp(text, "error", 5))) {
+			prefix = "✗ "; color = ANSI_ERR;
+		} else {
+			prefix = "  "; color = ANSI_SYS;
+		}
+		break;
 	}
-	if (E.color_enabled) printf("%s%s%s%s\n", color, prefix, text ? text : "", ANSI_RESET);
-	else printf("%s%s\n", prefix, text ? text : "");
+
+	/* Code-fence handling: detect ``` opening/closing on AI lines.
+	   Inside fence: render with bronze gutter + dim warm background (chalk on void). */
+	if (role == HK_ROLE_AI && text) {
+		const char *t = text;
+		while (*t == ' ' || *t == '\t') t++;
+		if (t[0] == '`' && t[1] == '`' && t[2] == '`') {
+			cl_in_codefence = !cl_in_codefence;
+			if (E.color_enabled) {
+				printf("%s%s%s%s%s\n", ANSI_TOOL, prefix, ANSI_DIM, cl_in_codefence ? "─── code ───" : "────────────", ANSI_RESET);
+			} else {
+				printf("%s%s\n", prefix, cl_in_codefence ? "--- code ---" : "------------");
+			}
+			fflush(stdout);
+			E.last_role_shown = role;
+			return;
+		}
+	}
+	if (role == HK_ROLE_AI && cl_in_codefence) {
+		if (E.color_enabled) {
+			printf("%s▎ %s%s%s\n", ANSI_TOOL, ANSI_AI, text ? text : "", ANSI_RESET);
+		} else {
+			printf("| %s\n", text ? text : "");
+		}
+		fflush(stdout);
+		E.last_role_shown = role;
+		return;
+	}
+
+	if (E.color_enabled && role == HK_ROLE_AI && text && *text) {
+		char rendered[8192];
+		clRenderMarkdownInline(text, rendered, sizeof(rendered));
+		printf("%s%s%s%s\n", color, prefix, rendered, ANSI_RESET);
+	} else if (E.color_enabled) {
+		printf("%s%s%s%s\n", color, prefix, text ? text : "", ANSI_RESET);
+	} else {
+		printf("%s%s\n", prefix, text ? text : "");
+	}
 	fflush(stdout);
+	E.last_role_shown = role;
 }
 
 static void aiPushHistoryStore(aiData *data, const char *text, unsigned char role) {
@@ -1303,6 +1825,78 @@ static void aiPushMessageBody(aiData *data, const char *role, const char *body_f
 	data->messages[data->message_count].content = strdup(body_fields);
 	data->messages[data->message_count].raw = 2;
 	data->message_count++;
+}
+
+/* Find last message with given role. Returns index or -1. */
+static int aiFindLastMessageRole(aiData *data, const char *role) {
+	if (!data || !role) return -1;
+	for (int i = data->message_count - 1; i >= 0; i--) {
+		if (data->messages[i].role && !strcmp(data->messages[i].role, role)) return i;
+	}
+	return -1;
+}
+
+/* Drop API messages from idx onward (inclusive). */
+static void aiDropMessagesFrom(aiData *data, int idx) {
+	if (!data || idx < 0 || idx >= data->message_count) return;
+	for (int i = idx; i < data->message_count; i++) {
+		free(data->messages[i].role); free(data->messages[i].content);
+	}
+	data->message_count = idx;
+}
+
+/* Drop trailing history entries whose role matches `role_to_drop`. */
+static void hkDropTrailingHistory(aiData *data, unsigned char role_to_drop) {
+	if (!data) return;
+	while (data->history_count > 0 && data->history_role[data->history_count - 1] == role_to_drop) {
+		free(data->history[--data->history_count]);
+		data->history[data->history_count] = NULL;
+	}
+}
+
+/* Mid-chat provider swap: tool-bearing messages (raw=1 Anthropic content array,
+   raw=2 OpenAI tool_calls/tool replies) carry schemas the new provider can't parse.
+   Flatten by extracting plain text and dropping the rest; pure-text turns survive. */
+static void aiFlattenMessages(aiData *data) {
+	if (!data || data->message_count == 0) return;
+	int kept = 0;
+	for (int i = 0; i < data->message_count; i++) {
+		aiMessage *m = &data->messages[i];
+		if (m->raw == 0) {
+			if (i != kept) data->messages[kept] = *m;
+			kept++;
+			continue;
+		}
+		/* raw=1 (Anthropic content array) or raw=2 (OpenAI body fields):
+		   pull any "text":"..." substring as plain content. tool role messages
+		   under raw=2 stored "tool" content text — keep as user-visible context. */
+		const char *src = m->content ? m->content : "";
+		char *text = NULL;
+		const char *p = strstr(src, "\"text\":\"");
+		if (p) {
+			p += 8;
+			text = aiExtractStringValue(p);
+		} else if (m->raw == 2) {
+			/* tool reply: "content":"..." */
+			const char *cp = strstr(src, "\"content\":\"");
+			if (cp) { cp += 11; text = aiExtractStringValue(cp); }
+		}
+		if (text && *text) {
+			/* "tool" role → demote to "user" so the new provider accepts it. */
+			int is_tool = m->role && !strcmp(m->role, "tool");
+			free(m->role);
+			free(m->content);
+			data->messages[kept].role = strdup(is_tool ? "user" : "assistant");
+			data->messages[kept].content = text;
+			data->messages[kept].raw = 0;
+			kept++;
+		} else {
+			free(m->role);
+			free(m->content);
+			free(text);
+		}
+	}
+	data->message_count = kept;
 }
 
 static void aiFreeMessages(aiData *data) {
@@ -1417,22 +2011,29 @@ static char *hkBuildToolsSchema(int provider_format) {
 	for (int i = 0; i < HK_TOOL_COUNT; i++) {
 		const hkToolDef *t = &HK_TOOLS[i];
 		if (i > 0) { if (len + 1 >= cap) { cap *= 2; out = realloc(out, cap); } out[len++] = ','; }
-		size_t need = len + strlen(t->name) + strlen(t->description) + strlen(t->props) + strlen(t->required) + 256;
+		/* Escape description — only field carrying free-form text. name/props/required
+		   are author-controlled JSON fragments and must remain literal. */
+		size_t dlen = strlen(t->description);
+		size_t desc_cap = dlen * 6 + 8;
+		char *desc_esc = malloc(desc_cap);
+		hkJsonEscapeInto(t->description, desc_esc, (int)desc_cap);
+		size_t need = len + strlen(t->name) + strlen(desc_esc) + strlen(t->props) + strlen(t->required) + 256;
 		if (need >= cap) { while (cap < need) cap *= 2; out = realloc(out, cap); }
 		const char *req_close_end = (*t->required) ? "]" : "";
 		if (provider_format == 0) {
 			len += snprintf(out + len, cap - len,
 				"{\"name\":\"%s\",\"description\":\"%s\",\"input_schema\":{\"type\":\"object\",\"properties\":{%s}%s%s%s}}",
-				t->name, t->description, t->props,
+				t->name, desc_esc, t->props,
 				(*t->required) ? ",\"required\":[" : "",
 				t->required, req_close_end);
 		} else {
 			len += snprintf(out + len, cap - len,
 				"{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":{\"type\":\"object\",\"properties\":{%s}%s%s%s}}}",
-				t->name, t->description, t->props,
+				t->name, desc_esc, t->props,
 				(*t->required) ? ",\"required\":[" : "",
 				t->required, req_close_end);
 		}
+		free(desc_esc);
 	}
 	if (len + 2 >= cap) { cap += 4; out = realloc(out, cap); }
 	out[len++] = ']';
@@ -1442,26 +2043,26 @@ static char *hkBuildToolsSchema(int provider_format) {
 
 static char *hkExecTool(const char *name, const char *input_json) {
 	if (strcmp(name, "read_file") == 0) {
-		if (!hkProjectTrusted()) return strdup("error: project not trusted — ask the user to run /trust before any file access");
+		if (!hkProjectTrusted()) return strdup("error: project not trusted — ask the user to run :trust before any file access");
 		char *path = hkExtractJsonString(input_json, "path");
 		if (!path) return strdup("error: missing path");
 		char full[PATH_MAX];
 		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
 			free(path);
-			return strdup("error: path outside project");
+			return strdup("error: path outside project. Use \".\" for project root, or a relative path. Do NOT retry with another absolute path; reply to the user in text instead.");
 		}
 		free(path);
 		char *c = hkReadFileAll(full, 100000);
 		return c ? c : strdup("error: cannot read");
 	}
 	if (strcmp(name, "list_dir") == 0) {
-		if (!hkProjectTrusted()) return strdup("error: project not trusted — ask the user to run /trust before any file access");
+		if (!hkProjectTrusted()) return strdup("error: project not trusted — ask the user to run :trust before any file access");
 		char *path = hkExtractJsonString(input_json, "path");
 		if (!path) return strdup("error: missing path");
 		char full[PATH_MAX];
 		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
 			free(path);
-			return strdup("error: path outside project");
+			return strdup("error: path outside project. Use \".\" for project root, or a relative path. Do NOT retry with another absolute path; reply to the user in text instead.");
 		}
 		free(path);
 		char *c = hkListDir(full);
@@ -1570,6 +2171,17 @@ static char *hkExecTool(const char *name, const char *input_json) {
 	return strdup("error: unknown tool");
 }
 
+/* Category glyph for a tool name. Unicode in color mode, ASCII fallback otherwise. */
+static const char *hkToolGlyph(const char *fname, int color) {
+	if (!fname) return color ? "▸" : ">";
+	if (!strcmp(fname, "read_file") || !strcmp(fname, "list_dir") ||
+	    !strcmp(fname, "read_skill") || !strcmp(fname, "list_open_files") ||
+	    !strcmp(fname, "read_open_file")) return color ? "◎" : "r";
+	if (!strcmp(fname, "write_file")) return color ? "✎" : "w";
+	if (!strcmp(fname, "run_shell"))   return color ? "❯" : "$";
+	return color ? "▸" : ">";
+}
+
 static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj) {
 	(void)data;
 	char arg_summary[128] = "";
@@ -1577,14 +2189,15 @@ static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj
 	char *cmd = hkExtractJsonString(args_obj, "cmd");
 	if (path) { snprintf(arg_summary, sizeof(arg_summary), "%s", path); free(path); }
 	else if (cmd) { snprintf(arg_summary, sizeof(arg_summary), "%.80s", cmd); free(cmd); }
+	const char *glyph = hkToolGlyph(fname, E.color_enabled);
 	if (E.pipe_mode) {
 		char display[256];
-		snprintf(display, sizeof(display), "→ %s(%s)", fname, arg_summary);
+		snprintf(display, sizeof(display), "%s %s(%s)", glyph, fname, arg_summary);
 		clPipeEmitDisplay("tool_start", display);
 		return;
 	}
-	if (E.color_enabled) printf("%s→ %s(%s)%s\n", ANSI_TOOL, fname, arg_summary, ANSI_RESET);
-	else printf("→ %s(%s)\n", fname, arg_summary);
+	if (E.color_enabled) printf("%s%s %s(%s)%s\n", ANSI_TOOL, glyph, fname, arg_summary, ANSI_RESET);
+	else printf("%s %s(%s)\n", glyph, fname, arg_summary);
 	fflush(stdout);
 }
 
@@ -1632,6 +2245,35 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 	}
 
 	int tools_on = E.ai_tools_enabled;
+	/* ReAct mode: don't include native function-calling schema in the request body.
+	   Instead the model emits <tool>...</tool> blocks in prose which we parse + execute
+	   in the worker loop. The ReAct system prompt is prepended in hkLoadSkills. */
+	if (E.ai_toolmode == 1) tools_on = 0;
+	/* Auto tool-gate: small / non-tool-tuned models often hallucinate tool calls on
+	   greetings. If the most recent message is a user turn lacking any tool keyword,
+	   drop the schema for this call. Once a tool has been used in this turn (last msg
+	   isn't user), keep tools so the loop can continue. */
+	if (tools_on && E.ai_tool_gate && data->message_count > 0) {
+		aiMessage *last = &data->messages[data->message_count - 1];
+		if (last->role && !strcmp(last->role, "user") && last->raw == 0 && last->content) {
+			static const char *keywords[] = {
+				"read", "list", "write", "run", "exec", "file", "files", "dir", "folder",
+				"directory", "ls", "cat", "show me", "open", "create", "edit", "save",
+				"delete", "remove", "find", "search", "grep", "shell", "command",
+				"contents", "what's in", "whats in", "what is in", "what files",
+				"this project", "this repo", "this directory", "this folder",
+				"the project", "the repo", "the directory", "the folder",
+				"source", "code base", "codebase", ".c", ".h", ".md", ".txt", ".json",
+				".py", ".js", ".ts", ".go", ".rs", "/", NULL
+			};
+			char *low = strdup(last->content);
+			for (int i = 0; low[i]; i++) if (low[i] >= 'A' && low[i] <= 'Z') low[i] += 32;
+			int hit = 0;
+			for (int i = 0; keywords[i] && !hit; i++) if (strstr(low, keywords[i])) hit = 1;
+			free(low);
+			if (!hit) tools_on = 0;
+		}
+	}
 	char *anth_tools = NULL, *fn_tools = NULL;
 	if (tools_on) {
 		anth_tools = hkBuildToolsSchema(0);
@@ -1660,7 +2302,9 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 		if (!endpoint) endpoint = "https://api.anthropic.com";
 		if (!model) model = "claude-sonnet-4-20250514";
 		int anth_on = tools_on && hkProjectTrusted();
-		int stream_on = E.ai_stream && !anth_on;
+		int oauth_anth = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
+		/* Anthropic OAuth endpoint streams unconditionally — force stream-on regardless. */
+		int stream_on = oauth_anth || (E.ai_stream && !anth_on);
 		int tlen = anth_on ? strlen(anth_tools) + 16 : 0;
 		int need = bodycap + tlen + 96;
 		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
@@ -1723,23 +2367,55 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 
 	switch (type) {
 	case AI_PROVIDER_OLLAMA:
-		snprintf(cmd, 4096,
-			"curl -s -X POST %s/api/chat -H 'Content-Type: application/json' --data @%s 2>/dev/null",
-			endpoint, reqfile);
+		if (api_key && *api_key) {
+			/* Ollama cloud (ollama.com) or any auth-gated Ollama-compat endpoint. */
+			snprintf(cmd, 4096,
+				"curl -s -X POST %s/api/chat -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' --data @%s 2>/dev/null",
+				endpoint, api_key, reqfile);
+		} else {
+			snprintf(cmd, 4096,
+				"curl -s -X POST %s/api/chat -H 'Content-Type: application/json' --data @%s 2>/dev/null",
+				endpoint, reqfile);
+		}
 		break;
 	case AI_PROVIDER_ANTHROPIC:
 		if (!api_key) { free(cmd); free(reqfile); return NULL; }
-		snprintf(cmd, 4096,
-			(E.ai_stream && !E.ai_tools_enabled)
-				? "curl -sN -X POST %s/v1/messages -H 'Content-Type: application/json' -H 'x-api-key: %s' -H 'anthropic-version: 2023-06-01' -H 'accept: text/event-stream' --data @%s 2>/dev/null"
-				: "curl -s -X POST %s/v1/messages -H 'Content-Type: application/json' -H 'x-api-key: %s' -H 'anthropic-version: 2023-06-01' --data @%s 2>/dev/null",
-			endpoint, api_key, reqfile);
+		{
+			int oauth = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
+			const char *auth_hdr = oauth
+				? "-H 'Authorization: Bearer %s' -H 'anthropic-beta: oauth-2025-04-20'"
+				: "-H 'x-api-key: %s'";
+			char hdr[256];
+			snprintf(hdr, sizeof(hdr), auth_hdr, api_key);
+			/* Must match the body's stream-on gate (line ~2305): stream when
+			   E.ai_stream is on AND we're not sending tools (no tools = no tool loop
+			   so streaming is safe; with tools we need a complete response to parse).
+			   anth_on = tools_on && trust, so stream when !anth_on.
+			   Special case: Anthropic OAuth endpoint streams unconditionally. */
+			int will_stream = oauth || (E.ai_stream && !(E.ai_tools_enabled && hkProjectTrusted()));
+			snprintf(cmd, 4096,
+				will_stream
+					? "curl -sN -X POST %s/v1/messages -H 'Content-Type: application/json' %s -H 'anthropic-version: 2023-06-01' -H 'accept: text/event-stream' --data @%s 2>/dev/null"
+					: "curl -s -X POST %s/v1/messages -H 'Content-Type: application/json' %s -H 'anthropic-version: 2023-06-01' --data @%s 2>/dev/null",
+				endpoint, hdr, reqfile);
+		}
 		break;
 	case AI_PROVIDER_OPENAI:
 		if (!api_key) { free(cmd); free(reqfile); return NULL; }
-		snprintf(cmd, 4096,
-			"curl -s -X POST %s/v1/chat/completions -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' --data @%s 2>/dev/null",
-			endpoint, api_key, reqfile);
+		{
+			int copilot = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot");
+			int ghmodels = endpoint && strstr(endpoint, "models.inference.ai.azure.com");
+			const char *path = (copilot || ghmodels) ? "/chat/completions" : "/v1/chat/completions";
+			const char *copilot_hdrs = copilot
+				? "-H 'Editor-Version: " CLAW_COPILOT_EDITOR_VER "' "
+				  "-H 'Editor-Plugin-Version: " CLAW_COPILOT_PLUGIN_VER "' "
+				  "-H 'Openai-Intent: conversation-panel' "
+				  "-H 'Copilot-Integration-Id: vscode-chat' "
+				: "";
+			snprintf(cmd, 4096,
+				"curl -s -X POST %s%s -H 'Content-Type: application/json' -H 'Authorization: Bearer %s' %s--data @%s 2>/dev/null",
+				endpoint, path, api_key, copilot_hdrs, reqfile);
+		}
 		break;
 	default: break;
 	}
@@ -1927,6 +2603,60 @@ static char *hkExtractRawJsonArray(const char *src, const char *key) {
 /* OpenAI/Ollama function-calling tool loop. Preserves tool_calls on assistant
    message and emits tool_call_id on each tool reply — required by strict
    validators (Gemini OpenAI-compat returns 400 INVALID_ARGUMENT otherwise). */
+/* Parse <tool name="X">{...json...}</tool> blocks from ReAct response content,
+   execute each, push an <observation> back as a user message. Returns count of
+   tools executed (0 = no tool blocks found = model produced final answer). */
+static int hkReactToolExecAll(aiData *data, const char *content) {
+	if (!data || !content) return 0;
+	int count = 0;
+	const char *cursor = content;
+	while ((cursor = strstr(cursor, "<tool")) != NULL) {
+		const char *name_attr = strstr(cursor, "name=\"");
+		if (!name_attr || name_attr > cursor + 32) { cursor++; continue; }
+		name_attr += 6;
+		const char *name_end = strchr(name_attr, '"');
+		if (!name_end) break;
+		int nlen = (int)(name_end - name_attr);
+		if (nlen <= 0 || nlen > 64) { cursor = name_end; continue; }
+		char tname[80];
+		memcpy(tname, name_attr, nlen); tname[nlen] = '\0';
+
+		const char *open_end = strchr(name_end, '>');
+		if (!open_end) break;
+		const char *body = open_end + 1;
+		const char *close_tag = strstr(body, "</tool>");
+		if (!close_tag) break;
+
+		/* Trim args JSON body. */
+		while (body < close_tag && (*body == ' ' || *body == '\n' || *body == '\r' || *body == '\t')) body++;
+		int blen = (int)(close_tag - body);
+		while (blen > 0 && (body[blen-1] == ' ' || body[blen-1] == '\n' || body[blen-1] == '\r' || body[blen-1] == '\t')) blen--;
+		char *args = malloc(blen + 1);
+		if (!args) { cursor = close_tag + 7; continue; }
+		memcpy(args, body, blen); args[blen] = '\0';
+
+		hkAnnounceTool(data, tname, args);
+		char *result = hkExecTool(tname, args);
+		hkAnnounceToolResult(data, result);
+
+		/* Push observation as user turn so model sees result on next API call. */
+		size_t rlen = result ? strlen(result) : 0;
+		char *obs = malloc(rlen + nlen + 64);
+		if (obs) {
+			snprintf(obs, rlen + nlen + 64, "<observation tool=\"%s\">%s</observation>",
+				tname, result ? result : "");
+			pthread_mutex_lock(&data->lock);
+			aiPushMessage(data, "user", obs);
+			pthread_mutex_unlock(&data->lock);
+			free(obs);
+		}
+		free(args); free(result);
+		count++;
+		cursor = close_tag + 7;
+	}
+	return count;
+}
+
 static int hkFnToolExecAll(aiData *data, const char *response) {
 	char *tool_calls_raw = hkExtractRawJsonArray(response, "tool_calls");
 	if (!tool_calls_raw) return 0;
@@ -1955,11 +2685,23 @@ static int hkFnToolExecAll(aiData *data, const char *response) {
 	int count = 0;
 	const char *p = strstr(response, "\"tool_calls\":[");
 	if (!p) return 0;
+	/* Dedupe seen tool_call_ids — some models (gpt-4o on GH Models free tier) emit
+	   the same id multiple times in one tool_calls array, which would push duplicate
+	   tool replies and 400 the next API call with "Duplicate value for tool_call_id". */
+	char *seen_ids[32] = {0};
+	int n_seen = 0;
 	while ((p = strstr(p, "\"function\""))) {
 		/* Walk back to the enclosing tool_call object to grab its id. */
 		const char *obj_start = p;
 		while (obj_start > response && *obj_start != '{') obj_start--;
 		char *tc_id = hkExtractJsonString(obj_start, "id");
+		/* Dedupe by id. */
+		if (tc_id) {
+			int dup = 0;
+			for (int i = 0; i < n_seen; i++) if (!strcmp(seen_ids[i], tc_id)) { dup = 1; break; }
+			if (dup) { free(tc_id); p++; continue; }
+			if (n_seen < 32) seen_ids[n_seen++] = strdup(tc_id);
+		}
 		char *fname = hkExtractJsonString(p, "name");
 		char *args_obj = hkExtractJsonObject(p, "arguments");
 		if (!args_obj) {
@@ -1995,6 +2737,7 @@ static int hkFnToolExecAll(aiData *data, const char *response) {
 		count++;
 		p++;
 	}
+	for (int i = 0; i < n_seen; i++) free(seen_ids[i]);
 	return count;
 }
 
@@ -2091,9 +2834,18 @@ static void clPrintMascot(void) {
 	}
 }
 
+/* Wall-clock millis since arbitrary epoch (used for turn duration). */
+static long clWallMs(void) {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
+}
+
 /*** worker thread ***/
 static void *aiWorkerThread(void *arg) {
 	aiData *data = (aiData *)arg;
+
+	data->turn_start_ms = clWallMs();
 
 	pthread_mutex_lock(&data->lock);
 	char *prompt = data->current_prompt ? strdup(data->current_prompt) : NULL;
@@ -2108,6 +2860,8 @@ static void *aiWorkerThread(void *arg) {
 	while (iter++ < max_iters) {
 		data->turn_index++;
 		clStartAnim(data);
+
+		clOAuthEnsureFresh(data);
 
 		pthread_mutex_lock(&data->lock);
 		char *cmd = aiBuildCurlCommand(data, E.ai_provider_type);
@@ -2150,8 +2904,12 @@ static void *aiWorkerThread(void *arg) {
 			return NULL;
 		}
 
-		int streaming_mode = (E.ai_provider_type == AI_PROVIDER_ANTHROPIC
-			&& E.ai_stream && !E.ai_tools_enabled);
+		/* Mirror the body/curl stream gate exactly. OAuth Anthropic forces SSE; otherwise
+		   stream when ai_stream is on AND we're not sending tools (tools need a complete
+		   response so we can extract tool_use blocks). */
+		int oauth_anth_resp = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
+		int streaming_mode = (E.ai_provider_type == AI_PROVIDER_ANTHROPIC) &&
+			(oauth_anth_resp || (E.ai_stream && !(E.ai_tools_enabled && hkProjectTrusted())));
 
 		char buffer[8192];
 		char *full_response = NULL;
@@ -2171,7 +2929,12 @@ static void *aiWorkerThread(void *arg) {
 				if (strncmp(buffer, "data: ", 6) != 0) continue;
 				const char *payload = buffer + 6;
 				if (!strstr(payload, "content_block_delta")) continue;
-				char *text = hkExtractJsonString(payload, "text");
+				char *raw = hkExtractJsonString(payload, "text");
+				if (!raw) continue;
+				/* Unescape \n, \", \t etc — hkExtractJsonString returns the raw JSON-encoded
+				   substring without resolving escape sequences. */
+				char *text = hkJsonUnescape(raw, (int)strlen(raw));
+				free(raw);
 				if (!text) continue;
 
 				size_t tlen = strlen(text);
@@ -2285,14 +3048,35 @@ static void *aiWorkerThread(void *arg) {
 			continue;
 		}
 
+		/* ReAct mode: scan plain-text content for <tool> blocks and execute. */
+		if (content && E.ai_toolmode == 1 && strstr(content, "<tool")) {
+			pthread_mutex_lock(&data->lock);
+			aiPushMessage(data, "assistant", content);
+			pthread_mutex_unlock(&data->lock);
+			int n = hkReactToolExecAll(data, content);
+			free(content);
+			free(full_response);
+			if (n == 0) break;  /* no parsable tool blocks — treat as final answer */
+			used_tool = 1;
+			continue;
+		}
+
 		if (content) {
 			pthread_mutex_lock(&data->lock);
 			aiPushMessage(data, "assistant", content);
 			pthread_mutex_unlock(&data->lock);
 		} else {
 			pthread_mutex_lock(&data->lock);
-			char err[256];
-			if (full_response) {
+			if (full_response && strstr(full_response, "llama runner process has terminated")) {
+				aiAddHistory(data, "Error: Ollama runner crashed (usually OOM or model corrupt).");
+				aiAddHistory(data, "  try: smaller model (/model llama3.2:3b), restart `ollama serve`,");
+				aiAddHistory(data, "  or `ollama rm <model> && ollama pull <model>` to refresh.");
+			} else if (full_response && strstr(full_response, "model requires more system memory")) {
+				aiAddHistory(data, "Error: model too large for available RAM. Pick a smaller variant.");
+			} else if (full_response && strstr(full_response, "model not found")) {
+				aiAddHistory(data, "Error: model not installed. Run `ollama pull <name>` first.");
+			} else if (full_response) {
+				char err[256];
 				snprintf(err, sizeof(err), "Error: empty response (first 180b: %.180s)", full_response);
 				aiAddHistory(data, err);
 			} else {
@@ -2308,6 +3092,7 @@ static void *aiWorkerThread(void *arg) {
 
 	pthread_mutex_lock(&data->lock);
 	if (iter >= max_iters && used_tool) aiAddHistory(data, "(tool loop cap reached)");
+	data->last_turn_ms = clWallMs() - data->turn_start_ms;
 	data->streaming = 0;
 	pthread_mutex_unlock(&data->lock);
 
@@ -2336,32 +3121,104 @@ static void aiWorkerSend(aiData *data) {
 
 /*** slash commands ***/
 static int hkHandleSlash(aiData *data, const char *prompt) {
-	if (prompt[0] != '/') return 0;
+	/* Accept both `:` (primary, vim/hako style) and `/` (legacy alias). */
+	if (prompt[0] != '/' && prompt[0] != ':') return 0;
 	const char *cmd = prompt + 1;
 	const char *arg = strchr(cmd, ' ');
 	int cmdlen = arg ? (arg - cmd) : (int)strlen(cmd);
 	if (arg) { while (*arg == ' ') arg++; }
 
 	if (strncmp(cmd, "help", cmdlen) == 0 && cmdlen == 4) {
-		aiAddHistory(data, "/clear  /help  /model <id>  /models  /provider <name>  /login [<provider>]");
-		aiAddHistory(data, "/history [local|global]  /skills [reload]");
-		aiAddHistory(data, "/skill install <url>  /skill uninstall <name>");
-		aiAddHistory(data, "/tools on|off  /trust [revoke]  /usage  /quit");
-		aiAddHistory(data, "/sessions  /resume <id>  /session [new]");
+		aiAddHistory(data, ":help  :clear  :retry  :edit  :undo  :usage  :q");
+		aiAddHistory(data, ":providers  :models  :provider <name>  :model <id>");
+		aiAddHistory(data, ":login [<provider>]  :logout [<provider>]  :accounts");
+		aiAddHistory(data, ":history [local|global]  :skills [reload]");
+		aiAddHistory(data, ":skill install <url>  :skill uninstall <name>");
+		aiAddHistory(data, ":tools on|off  :toolgate on|off  :toolmode native|react  :trust [revoke]");
+		aiAddHistory(data, ":sessions  :resume <id>  :session [new]");
+		aiAddHistory(data, "(`/` still works as alias for muscle memory)");
+		return 1;
+	}
+	if (strncmp(cmd, "retry", cmdlen) == 0 && cmdlen == 5) {
+		int u = aiFindLastMessageRole(data, "user");
+		if (u < 0) { aiAddHistory(data, "(no user message to retry)"); return 1; }
+		aiDropMessagesFrom(data, u + 1);
+		hkDropTrailingHistory(data, HK_ROLE_AI);
+		aiWorkerSend(data);
+		return 1;
+	}
+	if (strncmp(cmd, "edit", cmdlen) == 0 && cmdlen == 4) {
+		int u = aiFindLastMessageRole(data, "user");
+		if (u < 0) { aiAddHistory(data, "(no user message to edit)"); return 1; }
+		free(cl_preset_input);
+		cl_preset_input = strdup(data->messages[u].content ? data->messages[u].content : "");
+		aiDropMessagesFrom(data, u);
+		hkDropTrailingHistory(data, HK_ROLE_AI);
+		hkDropTrailingHistory(data, HK_ROLE_USER);
+		return 1;
+	}
+	if (strncmp(cmd, "undo", cmdlen) == 0 && cmdlen == 4) {
+		int u = aiFindLastMessageRole(data, "user");
+		if (u < 0) { aiAddHistory(data, "(nothing to undo)"); return 1; }
+		aiDropMessagesFrom(data, u + 1);
+		hkDropTrailingHistory(data, HK_ROLE_AI);
+		aiAddHistory(data, "(undone — last AI turn dropped)");
 		return 1;
 	}
 	if (strncmp(cmd, "login", cmdlen) == 0 && cmdlen == 5) {
 		const char *prov = (arg && *arg) ? arg : hkProviderName(E.ai_provider_type);
 		if (!prov || strcmp(prov, "none") == 0) {
-			aiAddHistory(data, "usage: /login <provider>  (anthropic, openai, ollama, groq, deepseek, mistral, together, fireworks, openrouter, xai, custom)");
+			aiAddHistory(data, "usage: :login <provider>");
+			aiAddHistory(data, "  OAuth (subscription/account-bound):");
+			aiAddHistory(data, "    anthropic          Claude Pro/Max");
+			aiAddHistory(data, "    copilot            GitHub Copilot Pro/Business");
+			aiAddHistory(data, "    github-models      free GitHub Models tier");
+			aiAddHistory(data, "    openrouter         PKCE — auto-issue OR API key");
+			aiAddHistory(data, "  paste API key (input hidden):");
+			aiAddHistory(data, "    anthropic-api, openai, gemini, groq, cerebras,");
+			aiAddHistory(data, "    deepseek, mistral, together, fireworks, xai, openrouter-api, custom");
+			aiAddHistory(data, "  local (no auth):");
+			aiAddHistory(data, "    ollama, ollamacloud");
 			return 1;
 		}
 		if (strcmp(prov, "ollama") == 0 || strcmp(prov, "local") == 0 || strcmp(prov, "koi") == 0) {
 			hkApplyProviderAlias(prov);
 			hkSaveSession();
 			aiAddHistory(data, "ollama is local — no API key needed.");
-			aiAddHistory(data, "ensure `ollama serve` is running, then /models to list, /model <id> to pick.");
+			aiAddHistory(data, "ensure `ollama serve` is running, then :models to list, :model <id> to pick.");
 			return 1;
+		}
+		/* Anthropic OAuth — sign in with Claude Pro / Max subscription. No paste fallback.
+		   For API-key paste use `/login anthropic-api`. */
+		if (strcmp(prov, "anthropic") == 0 || strcmp(prov, "claude") == 0) {
+			hkApplyProviderAlias("anthropic");
+			clOAuthAnthropic(data);
+			return 1;
+		}
+		if (strcmp(prov, "anthropic-api") == 0 || strcmp(prov, "claude-api") == 0) {
+			/* Force-route to API-key paste flow below by retargeting provider name. */
+			prov = "anthropic";
+			hkApplyProviderAlias("anthropic");
+		}
+		/* GitHub Copilot OAuth — device flow + Copilot session token exchange. */
+		if (strcmp(prov, "github-copilot") == 0 || strcmp(prov, "copilot") == 0) {
+			clOAuthGithubCopilot(data);
+			return 1;
+		}
+		/* GitHub Models OAuth — device flow, GH token used as Bearer (free tier). */
+		if (strcmp(prov, "github-models") == 0 || strcmp(prov, "ghmodels") == 0) {
+			clOAuthGithubModels(data);
+			return 1;
+		}
+		/* OpenRouter PKCE — auto-issue user-scoped API key. */
+		if (strcmp(prov, "openrouter") == 0) {
+			if (clOAuthOpenRouter(data) == 0) return 1;
+			aiAddHistory(data, "(OAuth aborted — try :login openrouter-api to paste an existing key)");
+			return 1;
+		}
+		if (strcmp(prov, "openrouter-api") == 0) {
+			prov = "openrouter";
+			hkApplyProviderAlias("openrouter");
 		}
 		const char *url = clProviderConsoleUrl(prov);
 		if (!url && strcmp(prov, "custom") != 0) {
@@ -2386,10 +3243,47 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		free(E.ai_api_key);
 		E.ai_api_key = strdup(key);
 		hkApplyProviderAlias(prov);
+		clCredsCaptureCurrent();
+		clCredsSave();
 		hkSaveSession();
-		char msg[128];
-		snprintf(msg, sizeof(msg), "key saved for %s (~/.hakoc/state, mode 0600)", hkProviderName(E.ai_provider_type));
+		char msg[160];
+		snprintf(msg, sizeof(msg), "key saved for %s (~/.hakoc/credentials, mode 0600, obfuscated)", hkProviderName(E.ai_provider_type));
 		aiAddHistory(data, msg);
+		return 1;
+	}
+	if (strncmp(cmd, "logout", cmdlen) == 0 && cmdlen == 6) {
+		const char *prov = (arg && *arg) ? arg : hkProviderName(E.ai_provider_type);
+		if (!prov || !strcmp(prov, "none")) { aiAddHistory(data, "no active provider"); return 1; }
+		clCred *c = clCredsFind(prov);
+		if (c) {
+			free(c->api_key); c->api_key = NULL;
+			free(c->oauth_refresh); c->oauth_refresh = NULL;
+			c->oauth_expires_at = 0;
+		}
+		if (!strcmp(prov, hkProviderName(E.ai_provider_type))) {
+			free(E.ai_api_key); E.ai_api_key = NULL;
+			free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+			free(E.ai_oauth_provider); E.ai_oauth_provider = NULL;
+			E.ai_oauth_expires_at = 0;
+		}
+		clCredsSave();
+		char msg[128];
+		snprintf(msg, sizeof(msg), "logged out: %s", prov);
+		aiAddHistory(data, msg);
+		return 1;
+	}
+	if (strncmp(cmd, "accounts", cmdlen) == 0 && cmdlen == 8) {
+		if (cl_creds_n == 0) { aiAddHistory(data, "(no saved logins — use :login <provider>)"); return 1; }
+		aiAddHistory(data, "saved logins:");
+		for (int i = 0; i < cl_creds_n; i++) {
+			clCred *c = &cl_creds[i];
+			if (!c->api_key && !c->oauth_refresh) continue;
+			const char *kind = c->oauth_refresh ? "oauth" : "key";
+			const char *active = !strcmp(c->provider, hkProviderName(E.ai_provider_type)) ? " *" : "";
+			char line[128];
+			snprintf(line, sizeof(line), "  %s (%s)%s", c->provider, kind, active);
+			aiAddHistory(data, line);
+		}
 		return 1;
 	}
 	if (strncmp(cmd, "clear", cmdlen) == 0 && cmdlen == 5) {
@@ -2417,63 +3311,181 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "models", cmdlen) == 0 && cmdlen == 6) {
+		const char *prov = hkProviderName(E.ai_provider_type);
 		const char *endpoint = E.ai_endpoint;
-		if (!endpoint || !*endpoint) endpoint = "http://localhost:11434";
-		char curlcmd[512];
-		snprintf(curlcmd, sizeof(curlcmd),
-			"curl -s --max-time 3 %s/api/tags 2>/dev/null", endpoint);
-		FILE *fp = popen(curlcmd, "r");
-		if (!fp) {
-			aiAddHistory(data, "/models: popen failed");
-			return 1;
-		}
-		size_t cap = 8192, len = 0;
-		char *buf = malloc(cap);
-		if (!buf) { pclose(fp); return 1; }
-		size_t got;
-		while ((got = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
-			len += got;
-			if (len + 1 >= cap) {
-				if (cap >= (1u << 22)) break;
-				cap *= 2;
-				char *nb = realloc(buf, cap);
-				if (!nb) break;
-				buf = nb;
+		/* Ollama / local: live query against /api/tags. Otherwise: curated suggestions. */
+		int is_ollama = (E.ai_provider_type == AI_PROVIDER_OLLAMA);
+		if (is_ollama) {
+			if (!endpoint || !*endpoint) endpoint = "http://localhost:11434";
+			char curlcmd[512];
+			snprintf(curlcmd, sizeof(curlcmd),
+				"curl -s --max-time 3 %s/api/tags 2>/dev/null", endpoint);
+			FILE *fp = popen(curlcmd, "r");
+			if (!fp) { aiAddHistory(data, "/models: popen failed"); return 1; }
+			size_t cap = 8192, len = 0;
+			char *buf = malloc(cap);
+			if (!buf) { pclose(fp); return 1; }
+			size_t got;
+			while ((got = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+				len += got;
+				if (len + 1 >= cap) {
+					if (cap >= (1u << 22)) break;
+					cap *= 2;
+					char *nb = realloc(buf, cap);
+					if (!nb) break;
+					buf = nb;
+				}
 			}
-		}
-		buf[len] = '\0';
-		pclose(fp);
-		if (len == 0) {
-			char msg[256];
-			snprintf(msg, sizeof(msg), "/models: no response from %s (is `ollama serve` running?)", endpoint);
-			aiAddHistory(data, msg);
+			buf[len] = '\0';
+			pclose(fp);
+			if (len == 0) {
+				char msg[256];
+				snprintf(msg, sizeof(msg), "/models: no response from %s (is `ollama serve` running?)", endpoint);
+				aiAddHistory(data, msg);
+				free(buf); return 1;
+			}
+			int count = 0;
+			const char *p = buf;
+			char hdr[128];
+			snprintf(hdr, sizeof(hdr), "installed locally on %s:", endpoint);
+			aiAddHistory(data, hdr);
+			while ((p = strstr(p, "\"name\":\"")) != NULL) {
+				p += 8;
+				const char *e = p;
+				while (*e && *e != '"') e++;
+				if (!*e) break;
+				char line[256];
+				int n = (int)(e - p);
+				if (n > 200) n = 200;
+				int active = E.ai_model && (int)strlen(E.ai_model) == n && !strncmp(E.ai_model, p, n);
+				snprintf(line, sizeof(line), "  %s %.*s", active ? "◎" : " ", n, p);
+				aiAddHistory(data, line);
+				count++;
+				p = e;
+			}
+			if (count == 0) {
+				aiAddHistory(data, "  (none — `ollama pull <model>` to add one)");
+			} else {
+				char msg[64];
+				snprintf(msg, sizeof(msg), "%d local model(s). /model <name> to select.", count);
+				aiAddHistory(data, msg);
+			}
 			free(buf);
 			return 1;
 		}
-		int count = 0;
-		const char *p = buf;
-		aiAddHistory(data, "available models:");
-		while ((p = strstr(p, "\"name\":\"")) != NULL) {
-			p += 8;
-			const char *e = p;
-			while (*e && *e != '"') e++;
-			if (!*e) break;
-			char line[256];
-			int n = (int)(e - p);
-			if (n > 200) n = 200;
-			snprintf(line, sizeof(line), "  %.*s", n, p);
-			aiAddHistory(data, line);
-			count++;
-			p = e;
+		/* Curated suggestions per provider. Not exhaustive; meant as starting points. */
+		struct { const char *prov; const char *models; } sugg[] = {
+			{ "anthropic",      "claude-opus-4-0, claude-sonnet-4-0, claude-haiku-4-5, claude-3-5-sonnet-latest, claude-3-5-haiku-latest" },
+			{ "openai",         "gpt-4o, gpt-4o-mini, gpt-5, o1, o1-mini, gpt-4.1" },
+			{ "gemini",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro, gemini-1.5-flash" },
+			{ "google",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro" },
+			{ "groq",           "llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768" },
+			{ "cerebras",       "llama3.1-70b, llama3.1-8b, llama-3.3-70b" },
+			{ "deepseek",       "deepseek-chat, deepseek-reasoner" },
+			{ "mistral",        "mistral-large-latest, mistral-small-latest, codestral-latest" },
+			{ "together",       "meta-llama/Llama-3.3-70B-Instruct-Turbo, Qwen/Qwen2.5-72B-Instruct-Turbo" },
+			{ "fireworks",      "accounts/fireworks/models/llama-v3p1-70b-instruct, accounts/fireworks/models/qwen2p5-72b-instruct" },
+			{ "openrouter",     "anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.3-70b-instruct:free, deepseek/deepseek-chat:free" },
+			{ "xai",            "grok-2, grok-2-mini, grok-beta" },
+			{ "grok",           "grok-2, grok-2-mini, grok-beta" },
+		};
+		const char *models = NULL;
+		const char *match_against = prov;
+		if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) match_against = "copilot";
+		if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) match_against = "github-models";
+		/* Special-case OAuth providers: */
+		if (!strcmp(match_against, "copilot")) {
+			models = "gpt-4o, gpt-4o-mini, o1-mini, claude-3.5-sonnet, claude-3.7-sonnet";
+		} else if (!strcmp(match_against, "github-models")) {
+			models = "gpt-4o, gpt-4o-mini, meta-llama-3-70b-instruct, mistral-large, microsoft/phi-3.5-mini";
 		}
-		if (count == 0) {
-			aiAddHistory(data, "  (none — pull one with `ollama pull <model>`)");
+		if (!models) {
+			for (size_t i = 0; i < sizeof(sugg) / sizeof(sugg[0]); i++) {
+				if (!strcmp(sugg[i].prov, match_against)) { models = sugg[i].models; break; }
+			}
+		}
+		char hdr[128];
+		snprintf(hdr, sizeof(hdr), "suggested models for %s%s:",
+			match_against,
+			(E.ai_oauth_provider && (!strcmp(match_against, "copilot") || !strcmp(match_against, "github-models"))) ? " (OAuth)" : "");
+		aiAddHistory(data, hdr);
+		if (!models) {
+			aiAddHistory(data, "  (no curated list — check provider docs)");
 		} else {
-			char msg[64];
-			snprintf(msg, sizeof(msg), "%d model(s). use /model <name> to select.", count);
-			aiAddHistory(data, msg);
+			/* Split by ", " and indent each. */
+			const char *p = models;
+			while (*p) {
+				const char *e = strchr(p, ',');
+				if (!e) e = p + strlen(p);
+				while (*p == ' ') p++;
+				int active = E.ai_model && (e - p == (long)strlen(E.ai_model)) && !strncmp(E.ai_model, p, e - p);
+				char line[256];
+				snprintf(line, sizeof(line), "  %s %.*s", active ? "◎" : " ", (int)(e - p), p);
+				aiAddHistory(data, line);
+				if (!*e) break;
+				p = e + 1;
+			}
 		}
-		free(buf);
+		aiAddHistory(data, ":model <id> to select.  :providers to see all providers.");
+		return 1;
+	}
+	if (strncmp(cmd, "providers", cmdlen) == 0 && cmdlen == 9) {
+		struct row { const char *name; const char *desc; };
+		struct group { const char *header; struct row rows[10]; };
+		struct group groups[] = {
+			{ "OAuth (subscription / account-bound):", {
+				{ "anthropic",       "Claude Pro/Max — sign in with claude.ai" },
+				{ "copilot",         "GitHub Copilot Pro/Business — device flow" },
+				{ "github-models",   "free GitHub Models tier — device flow" },
+				{ "openrouter",      "PKCE — auto-issue OR API key" },
+				{ NULL, NULL }
+			} },
+			{ "Local (no auth):", {
+				{ "ollama",          "run `ollama serve` first" },
+				{ "ollamacloud",     "hosted Ollama (ollama.com)" },
+				{ NULL, NULL }
+			} },
+			{ "Pay-per-token (API key paste):", {
+				{ "anthropic-api",   "Claude API key (separate from sub)" },
+				{ "openai",          "ChatGPT API" },
+				{ "gemini",          "Google AI Studio — generous free tier" },
+				{ "groq",            "fastest Llama hosting — free tier" },
+				{ "cerebras",        "ultra-fast inference — free tier" },
+				{ "deepseek",        "DeepSeek API" },
+				{ "xai",             "Grok via xAI API (api.x.ai)" },
+				{ "openrouter-api",  "paste existing OR key (vs PKCE issue)" },
+				{ "mistral, together, fireworks, custom", "more OpenAI-compat" },
+				{ NULL, NULL }
+			} },
+		};
+		const char *active_prov = hkProviderName(E.ai_provider_type);
+		const char *active_oauth = E.ai_oauth_provider;
+		for (size_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
+			aiAddHistory(data, groups[g].header);
+			for (size_t r = 0; r < 10 && groups[g].rows[r].name; r++) {
+				const char *n = groups[g].rows[r].name;
+				int logged_in = 0, is_active = 0;
+				/* Strip aliases (only check the first word before comma) for status checks. */
+				char namebuf[64]; namebuf[0] = '\0';
+				size_t nlen = 0;
+				while (n[nlen] && n[nlen] != ',' && n[nlen] != ' ' && nlen + 1 < sizeof(namebuf)) {
+					namebuf[nlen] = n[nlen]; nlen++;
+				}
+				namebuf[nlen] = '\0';
+				if (clCredsFind(namebuf)) logged_in = 1;
+				if (!strcmp(namebuf, active_prov)) is_active = 1;
+				if (active_oauth && !strcmp(namebuf, active_oauth)) is_active = 1;
+				char line[256];
+				snprintf(line, sizeof(line), "  %s%s  %-22s %s",
+					is_active ? "◎" : " ",
+					logged_in ? "*" : " ",
+					n,
+					groups[g].rows[r].desc);
+				aiAddHistory(data, line);
+			}
+		}
+		aiAddHistory(data, ":login <provider> to authenticate.  :models for model suggestions.");
+		aiAddHistory(data, "(◎ = active, * = saved login)");
 		return 1;
 	}
 	if (strncmp(cmd, "provider", cmdlen) == 0 && cmdlen == 8) {
@@ -2484,7 +3496,27 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				aiAddHistory(data, "  groq, cerebras, deepseek, mistral, together, fireworks,");
 				aiAddHistory(data, "  openrouter, xai/grok, custom");
 			} else {
+				enum aiProviderType prev = E.ai_provider_type;
+				/* Snapshot outgoing provider's secrets so a later swap back finds them. */
+				clCredsCaptureCurrent();
 				hkApplyProviderAlias(arg);
+				/* Restore (or clear) secrets for the incoming provider. */
+				clCredsRestoreFor(hkProviderName(E.ai_provider_type));
+				/* Wire-format change → flatten tool-bearing messages so the new
+				   provider sees a clean role/content history it can parse. */
+				if (prev != E.ai_provider_type) {
+					pthread_mutex_lock(&data->lock);
+					int before = data->message_count;
+					aiFlattenMessages(data);
+					int after = data->message_count;
+					pthread_mutex_unlock(&data->lock);
+					if (before != after) {
+						char fmsg[128];
+						snprintf(fmsg, sizeof(fmsg), "(flattened %d tool turn(s) for swap)", before - after);
+						aiAddHistory(data, fmsg);
+					}
+				}
+				clCredsSave();
 				hkSaveSession();
 				char msg[256];
 				snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
@@ -2538,7 +3570,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		char p[512];
 		hkHistoryPath(p, sizeof(p));
 		aiAddHistory(data, p);
-		aiAddHistory(data, "(use /history local | /history global)");
+		aiAddHistory(data, "(use :history local | :history global)");
 		return 1;
 	}
 	if (strncmp(cmd, "skills", cmdlen) == 0 && cmdlen == 6) {
@@ -2631,6 +3663,34 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		aiAddHistory(data, msg);
 		return 1;
 	}
+	if (strncmp(cmd, "toolgate", cmdlen) == 0 && cmdlen == 8) {
+		int changed = 0;
+		if (arg && strcmp(arg, "on") == 0) { E.ai_tool_gate = 1; changed = 1; }
+		else if (arg && strcmp(arg, "off") == 0) { E.ai_tool_gate = 0; changed = 1; }
+		if (changed) hkSaveSession();
+		char msg[128];
+		snprintf(msg, sizeof(msg),
+			"toolgate: %s%s — drops tool schema when user msg has no tool-keyword (helps small models).",
+			E.ai_tool_gate ? "on" : "off", changed ? " (saved)" : "");
+		aiAddHistory(data, msg);
+		return 1;
+	}
+	if (strncmp(cmd, "toolmode", cmdlen) == 0 && cmdlen == 8) {
+		int changed = 0;
+		if (arg && (!strcmp(arg, "native") || !strcmp(arg, "fn"))) { E.ai_toolmode = 0; changed = 1; }
+		else if (arg && (!strcmp(arg, "react") || !strcmp(arg, "xml"))) { E.ai_toolmode = 1; changed = 1; }
+		if (changed) { hkSaveSession(); hkLoadSkills(data); }
+		char msg[256];
+		snprintf(msg, sizeof(msg),
+			"toolmode: %s%s — %s",
+			E.ai_toolmode == 1 ? "react" : "native",
+			changed ? " (saved)" : "",
+			E.ai_toolmode == 1
+				? "models emit <tool>...</tool> blocks in prose (works with any instruct model)"
+				: "uses provider's native function-calling schema (Anthropic/OpenAI/Qwen2.5/Llama3.1+)");
+		aiAddHistory(data, msg);
+		return 1;
+	}
 	if (strncmp(cmd, "trust", cmdlen) == 0 && cmdlen == 5) {
 		if (arg && strcmp(arg, "revoke") == 0) {
 			char dir[PATH_MAX];
@@ -2651,10 +3711,17 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if ((strncmp(cmd, "quit", cmdlen) == 0 && cmdlen == 4) ||
-		(strncmp(cmd, "exit", cmdlen) == 0 && cmdlen == 4)) {
+		(strncmp(cmd, "exit", cmdlen) == 0 && cmdlen == 4) ||
+		(cmdlen == 1 && cmd[0] == 'q')) {
 		return 2;
 	}
 	if (strncmp(cmd, "usage", cmdlen) == 0 && cmdlen == 5) {
+		if (arg && !strcmp(arg, "reset")) {
+			data->last_in_tokens = data->last_out_tokens = 0;
+			data->total_in_tokens = data->total_out_tokens = 0;
+			aiAddHistory(data, "(usage counters reset)");
+			return 1;
+		}
 		char msg[256];
 		snprintf(msg, sizeof(msg), "provider: %s", hkProviderName(E.ai_provider_type));
 		aiAddHistory(data, msg);
@@ -2679,6 +3746,21 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			data->last_in_tokens, data->last_out_tokens,
 			data->total_in_tokens, data->total_out_tokens, E.ai_max_tokens);
 		aiAddHistory(data, msg);
+		double cost = hkSessionCostUSD(data);
+		const char *flat = hkFreeTierLabel();
+		if (flat && !strcmp(flat, "sub")) {
+			aiAddHistory(data, "cost:     bundled in subscription");
+		} else if (flat && !strcmp(flat, "free")) {
+			aiAddHistory(data, "cost:     free tier (rate-limited by provider)");
+		} else if (flat) {
+			aiAddHistory(data, "cost:     $0 (local)");
+		} else if (cost < 0) {
+			snprintf(msg, sizeof(msg), "cost:     (no price entry for model '%s')", E.ai_model ? E.ai_model : "");
+			aiAddHistory(data, msg);
+		} else {
+			snprintf(msg, sizeof(msg), "cost:     $%.4f estimated (session-only; provider invoice is authoritative)", cost);
+			aiAddHistory(data, msg);
+		}
 		return 1;
 	}
 	if (strncmp(cmd, "sessions", cmdlen) == 0 && cmdlen == 8) {
@@ -2841,6 +3923,7 @@ static void clInitConfig(void) {
 	E.ai_temperature = 70;
 	E.ai_max_tokens = 2048;
 	E.ai_tools_enabled = 1;
+	E.ai_tool_gate = 1;
 	E.ai_stream = 1;
 	E.ai_autowrite = 1;
 	E.anim_force_style = -1;
@@ -2876,6 +3959,8 @@ static void clCleanupConfig(void) {
 	free(E.ai_model);
 	free(E.session_id);
 	free(E.mascot_path);
+	free(E.ai_oauth_provider);
+	free(E.ai_oauth_refresh);
 	clFreeMascot();
 }
 
@@ -2886,6 +3971,9 @@ static void clSigint(int sig) {
 }
 
 /*** termios raw line editor ***/
+
+/* Defined as forward decl earlier for slash command access. */
+
 #ifndef _WIN32
 static struct termios cl_orig_termios;
 static int cl_raw_active = 0;
@@ -3087,6 +4175,15 @@ static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
 	int in_paste = 0;
 	buf[0] = '\0';
 
+	if (cl_preset_input) {
+		size_t pl = strlen(cl_preset_input);
+		if (pl >= sizeof(buf)) pl = sizeof(buf) - 1;
+		memcpy(buf, cl_preset_input, pl);
+		buf[pl] = '\0';
+		len = cur = (int)pl;
+		free(cl_preset_input); cl_preset_input = NULL;
+	}
+
 	clRedrawLine(prompt, buf, len, cur);
 
 	while (1) {
@@ -3157,6 +4254,62 @@ static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
 			memmove(&buf[i], &buf[cur], len - cur);
 			len -= (cur - i); cur = i; buf[len] = '\0';
 			clRedrawLine(prompt, buf, len, cur); continue;
+		}
+		if (c == 9) {
+			/* TAB completion: commands + provider names after :login / :provider / :logout. */
+			if ((buf[0] != '/' && buf[0] != ':') || cur != len) continue;
+			static const char *slash_cmds[] = {
+				"accounts", "clear", "edit", "help", "history", "login", "logout",
+				"model", "models", "provider", "providers", "quit", "resume", "retry", "session",
+				"sessions", "skill", "skills", "tools", "toolgate", "toolmode", "trust", "undo", "usage", NULL
+			};
+			static const char *provs[] = {
+				"anthropic", "anthropic-api", "claude", "claude-api", "openai",
+				"github-copilot", "copilot", "github-models", "ghmodels",
+				"ollama", "ollamacloud", "ocloud", "local", "koi",
+				"gemini", "google", "groq", "cerebras", "deepseek", "mistral",
+				"together", "fireworks", "openrouter", "openrouter-api",
+				"xai", "grok", "github", "custom", NULL
+			};
+			char prefix_char = buf[0];  /* preserve `:` or `/` user typed */
+			const char *sp = strchr(buf, ' ');
+			if (!sp) {
+				const char *partial = buf + 1;
+				size_t plen2 = strlen(partial);
+				const char *only = NULL; int nm = 0;
+				for (int i = 0; slash_cmds[i]; i++) {
+					if (strncmp(slash_cmds[i], partial, plen2) == 0) { only = slash_cmds[i]; nm++; }
+				}
+				if (nm == 1) {
+					size_t mlen = strlen(only);
+					if (1 + mlen + 1 < sizeof(buf)) {
+						buf[0] = prefix_char; memcpy(buf + 1, only, mlen);
+						buf[1 + mlen] = ' '; buf[1 + mlen + 1] = '\0';
+						len = cur = (int)(1 + mlen + 1);
+					}
+				}
+			} else {
+				int wants = !strncmp(buf + 1, "login ", 6) || !strncmp(buf + 1, "provider ", 9) || !strncmp(buf + 1, "logout ", 7);
+				if (wants) {
+					const char *arg2 = sp + 1; while (*arg2 == ' ') arg2++;
+					size_t alen = strlen(arg2);
+					const char *only = NULL; int nm = 0;
+					for (int i = 0; provs[i]; i++) {
+						if (strncmp(provs[i], arg2, alen) == 0) { only = provs[i]; nm++; }
+					}
+					if (nm == 1) {
+						int prefix_len = (int)(arg2 - buf);
+						size_t mlen = strlen(only);
+						if (prefix_len + mlen + 1 < (int)sizeof(buf)) {
+							memcpy(buf + prefix_len, only, mlen);
+							buf[prefix_len + mlen] = '\0';
+							len = cur = prefix_len + (int)mlen;
+						}
+					}
+				}
+			}
+			clRedrawLine(prompt, buf, len, cur);
+			continue;
 		}
 		if (c == 12) {
 			if (write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7) < 0) {}
@@ -3299,6 +4452,604 @@ static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
 			continue;
 		}
 	}
+}
+
+/*** OAuth (Anthropic Claude Pro / Max subscription) ***/
+/* PKCE auth-code flow with manual code paste. Lifted from Claude Code's own
+   public client_id (also used by opencode + other community CLIs). No registration
+   needed on user's side — they sign in with their existing Anthropic account.
+   Access token used as Bearer on api.anthropic.com with `anthropic-beta:
+   oauth-2025-04-20` header. Refresh token rotates the access token automatically
+   via clOAuthEnsureFresh before each turn. */
+
+#define CLAW_ANTHROPIC_CLIENT_ID  "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+#define CLAW_ANTHROPIC_REDIRECT   "https://console.anthropic.com/oauth/code/callback"
+#define CLAW_ANTHROPIC_AUTH_URL   "https://claude.ai/oauth/authorize"
+#define CLAW_ANTHROPIC_TOKEN_URL  "https://console.anthropic.com/v1/oauth/token"
+#define CLAW_ANTHROPIC_SCOPE      "org:create_api_key user:profile user:inference"
+
+/* GitHub Copilot — VS Code Copilot extension's public client_id. Device-flow OAuth on
+   github.com, then exchange the GH access token for a short-lived Copilot session token
+   at api.github.com/copilot_internal/v2/token. Copilot session token expires ~25 min;
+   GH access token is long-lived and stored in ai_oauth_refresh.
+   EDITOR_VER + PLUGIN_VER live at top of file so hkBuildCurlCmd can reference them. */
+#define CLAW_COPILOT_CLIENT_ID    "Iv1.b507a08c87ecfe98"
+#define CLAW_COPILOT_DEVICE_URL   "https://github.com/login/device/code"
+#define CLAW_COPILOT_TOKEN_URL    "https://github.com/login/oauth/access_token"
+#define CLAW_COPILOT_EXCHANGE_URL "https://api.github.com/copilot_internal/v2/token"
+
+/* GitHub Models — free for all GitHub users (rate-limited). gh CLI public client_id
+   (broad scope). Token used as Bearer against the Azure-hosted models endpoint. */
+#define CLAW_GHMODELS_CLIENT_ID   "178c6fc778ccc68e1d6a"
+#define CLAW_GHMODELS_ENDPOINT    "https://models.inference.ai.azure.com"
+
+/* OpenRouter PKCE — no client_id needed; just a code_challenge + callback URL.
+   Exchange at openrouter.ai/api/v1/auth/keys returns a user-scoped API key. */
+#define CLAW_OR_AUTH_URL          "https://openrouter.ai/auth"
+#define CLAW_OR_EXCHANGE_URL      "https://openrouter.ai/api/v1/auth/keys"
+
+static const char *clOAuthClientId(const char *provider) {
+	const char *k;
+	if (!strcmp(provider, "anthropic")) {
+		if ((k = getenv("CLAW_ANTHROPIC_CLIENT_ID")) && *k) return k;
+		return CLAW_ANTHROPIC_CLIENT_ID;
+	}
+	if (!strcmp(provider, "github-copilot") || !strcmp(provider, "copilot")) {
+		if ((k = getenv("CLAW_COPILOT_CLIENT_ID")) && *k) return k;
+		return CLAW_COPILOT_CLIENT_ID;
+	}
+	return NULL;
+}
+
+/* curl POST helper for OAuth/exchange flows. Returns malloc'd response or NULL.
+   extra_headers: additional `-H 'Key: Val'` blocks (may be NULL). */
+static char *clCurlPost(const char *url, const char *json_body, const char *extra_headers) {
+	char tmpl[] = "/tmp/hakoc-curl-XXXXXX";
+	int fd = mkstemp(tmpl);
+	if (fd < 0) return NULL;
+	if (write(fd, json_body, strlen(json_body)) < 0) { close(fd); unlink(tmpl); return NULL; }
+	close(fd);
+	char cmd[2048];
+	snprintf(cmd, sizeof(cmd),
+		"curl -s -X POST %s -A 'hakoCLAW/%s' -H 'Content-Type: application/json' -H 'Accept: application/json' %s --data @%s 2>/dev/null",
+		url, CLAW_VERSION, extra_headers ? extra_headers : "", tmpl);
+	FILE *fp = popen(cmd, "r");
+	if (!fp) { unlink(tmpl); return NULL; }
+	size_t cap = 4096, len = 0;
+	char *buf = malloc(cap);
+	size_t n;
+	while ((n = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+		len += n;
+		if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+	}
+	buf[len] = '\0';
+	pclose(fp);
+	unlink(tmpl);
+	return buf;
+}
+
+/* curl GET helper. Returns malloc'd response or NULL. */
+static char *clCurlGet(const char *url, const char *extra_headers) {
+	char cmd[2048];
+	snprintf(cmd, sizeof(cmd),
+		"curl -s -X GET %s -A 'hakoCLAW/%s' -H 'Accept: application/json' %s 2>/dev/null",
+		url, CLAW_VERSION, extra_headers ? extra_headers : "");
+	FILE *fp = popen(cmd, "r");
+	if (!fp) return NULL;
+	size_t cap = 4096, len = 0;
+	char *buf = malloc(cap);
+	size_t n;
+	while ((n = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+		len += n;
+		if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+	}
+	buf[len] = '\0';
+	pclose(fp);
+	return buf;
+}
+
+/* GitHub Copilot device-flow OAuth + Copilot session token exchange. */
+static int clOAuthGithubCopilot(aiData *data) {
+	const char *client_id = clOAuthClientId("github-copilot");
+	if (!client_id) { aiAddHistory(data, "OAuth: no copilot client_id"); return -1; }
+
+	/* Step 1: device authorization. */
+	char body[256];
+	snprintf(body, sizeof(body), "{\"client_id\":\"%s\",\"scope\":\"read:user\"}", client_id);
+	char *resp = clCurlPost(CLAW_COPILOT_DEVICE_URL, body, NULL);
+	if (!resp) { aiAddHistory(data, "OAuth: device request failed"); return -1; }
+	char *device_code = hkExtractJsonString(resp, "device_code");
+	char *user_code = hkExtractJsonString(resp, "user_code");
+	char *verify_uri = hkExtractJsonString(resp, "verification_uri");
+	int interval = hkExtractJsonInt(resp, "interval");
+	int expires_in = hkExtractJsonInt(resp, "expires_in");
+	free(resp);
+	if (!device_code || !user_code || !verify_uri) {
+		aiAddHistory(data, "OAuth: malformed device response");
+		free(device_code); free(user_code); free(verify_uri); return -1;
+	}
+	if (interval <= 0) interval = 5;
+	if (expires_in <= 0) expires_in = 900;
+
+	char line[512];
+	snprintf(line, sizeof(line), "Visit: %s", verify_uri); aiAddHistory(data, line);
+	snprintf(line, sizeof(line), "Code:  %s", user_code); aiAddHistory(data, line);
+	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
+	clOpenUrl(verify_uri);
+
+	/* Step 2: poll token endpoint. */
+	long start = (long)time(NULL);
+	char *gh_token = NULL;
+	const char *grant = "urn:ietf:params:oauth:grant-type:device_code";
+	while (!E.interrupt && (long)time(NULL) - start < expires_in) {
+		sleep(interval);
+		char poll[768];
+		snprintf(poll, sizeof(poll),
+			"{\"client_id\":\"%s\",\"device_code\":\"%s\",\"grant_type\":\"%s\"}",
+			client_id, device_code, grant);
+		char *tr = clCurlPost(CLAW_COPILOT_TOKEN_URL, poll, NULL);
+		if (!tr) continue;
+		gh_token = hkExtractJsonString(tr, "access_token");
+		if (gh_token) { free(tr); break; }
+		char *err = hkExtractJsonString(tr, "error");
+		if (err && strcmp(err, "authorization_pending") != 0 && strcmp(err, "slow_down") != 0) {
+			char *desc = hkExtractJsonString(tr, "error_description");
+			snprintf(line, sizeof(line), "OAuth: %s%s%s", err, desc ? ": " : "", desc ? desc : "");
+			aiAddHistory(data, line);
+			free(err); free(desc); free(tr);
+			free(device_code); free(user_code); free(verify_uri);
+			return -1;
+		}
+		if (err && !strcmp(err, "slow_down")) interval += 5;
+		free(err); free(tr);
+	}
+	free(device_code); free(user_code); free(verify_uri);
+	if (!gh_token) { aiAddHistory(data, "OAuth: timed out / aborted"); return -1; }
+
+	/* Step 3: exchange GH access token for Copilot session token.
+	   Store GH token in ai_oauth_refresh (long-lived); Copilot session in ai_api_key. */
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = gh_token;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("github-copilot");
+	hkApplyProviderAlias("github-copilot");
+	if (clOAuthCopilotExchange(data) != 0) {
+		aiAddHistory(data, "OAuth: GH token saved but Copilot exchange failed. Possibly no Copilot Pro on this GH account.");
+		return -1;
+	}
+	aiAddHistory(data, "GitHub Copilot OAuth: signed in. Calls bill against your Copilot Pro subscription.");
+	return 0;
+}
+
+/* GitHub Models — same device-flow harness as Copilot, different scope + endpoint.
+   No second exchange step; GH access token is used directly as Bearer. */
+static int clOAuthGithubModels(aiData *data) {
+	const char *client_id = CLAW_GHMODELS_CLIENT_ID;
+	const char *k = getenv("CLAW_GHMODELS_CLIENT_ID");
+	if (k && *k) client_id = k;
+
+	char body[256];
+	snprintf(body, sizeof(body), "{\"client_id\":\"%s\",\"scope\":\"read:user\"}", client_id);
+	char *resp = clCurlPost(CLAW_COPILOT_DEVICE_URL, body, NULL);
+	if (!resp) { aiAddHistory(data, "OAuth: device request failed"); return -1; }
+	char *device_code = hkExtractJsonString(resp, "device_code");
+	char *user_code = hkExtractJsonString(resp, "user_code");
+	char *verify_uri = hkExtractJsonString(resp, "verification_uri");
+	int interval = hkExtractJsonInt(resp, "interval");
+	int expires_in = hkExtractJsonInt(resp, "expires_in");
+	free(resp);
+	if (!device_code || !user_code || !verify_uri) {
+		aiAddHistory(data, "OAuth: malformed device response");
+		free(device_code); free(user_code); free(verify_uri); return -1;
+	}
+	if (interval <= 0) interval = 5;
+	if (expires_in <= 0) expires_in = 900;
+
+	char line[512];
+	snprintf(line, sizeof(line), "Visit: %s", verify_uri); aiAddHistory(data, line);
+	snprintf(line, sizeof(line), "Code:  %s", user_code); aiAddHistory(data, line);
+	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
+	clOpenUrl(verify_uri);
+
+	long start = (long)time(NULL);
+	char *gh_token = NULL;
+	const char *grant = "urn:ietf:params:oauth:grant-type:device_code";
+	while (!E.interrupt && (long)time(NULL) - start < expires_in) {
+		sleep(interval);
+		char poll[768];
+		snprintf(poll, sizeof(poll),
+			"{\"client_id\":\"%s\",\"device_code\":\"%s\",\"grant_type\":\"%s\"}",
+			client_id, device_code, grant);
+		char *tr = clCurlPost(CLAW_COPILOT_TOKEN_URL, poll, NULL);
+		if (!tr) continue;
+		gh_token = hkExtractJsonString(tr, "access_token");
+		if (gh_token) { free(tr); break; }
+		char *err = hkExtractJsonString(tr, "error");
+		if (err && strcmp(err, "authorization_pending") != 0 && strcmp(err, "slow_down") != 0) {
+			char *desc = hkExtractJsonString(tr, "error_description");
+			snprintf(line, sizeof(line), "OAuth: %s%s%s", err, desc ? ": " : "", desc ? desc : "");
+			aiAddHistory(data, line);
+			free(err); free(desc); free(tr);
+			free(device_code); free(user_code); free(verify_uri);
+			return -1;
+		}
+		if (err && !strcmp(err, "slow_down")) interval += 5;
+		free(err); free(tr);
+	}
+	free(device_code); free(user_code); free(verify_uri);
+	if (!gh_token) { aiAddHistory(data, "OAuth: timed out / aborted"); return -1; }
+
+	/* GH token IS the API key for GH Models. No second exchange. */
+	hkApplyProviderAlias("github-models");
+	free(E.ai_endpoint); E.ai_endpoint = strdup(CLAW_GHMODELS_ENDPOINT);
+	free(E.ai_api_key); E.ai_api_key = gh_token;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("github-models");
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+	E.ai_oauth_expires_at = 0;  /* GH tokens are long-lived */
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	aiAddHistory(data, "GitHub Models OAuth: signed in. Free tier, rate-limited by GitHub.");
+	aiAddHistory(data, "Try /model gpt-4o or /model meta-llama-3-70b-instruct");
+	return 0;
+}
+
+/* OpenRouter PKCE — loopback callback, plain code_challenge. Exchange returns a
+   user-scoped API key (not an OAuth token; it's a real OR API key). */
+static int clOAuthOpenRouter(aiData *data) {
+#ifdef _WIN32
+	(void)data; aiAddHistory(data, "OpenRouter OAuth: Windows loopback not wired (use :login openrouter-api for paste)"); return -1;
+#else
+	int port = 0;
+	int srv = clOAuthLoopbackListen(&port);
+	if (srv < 0) { aiAddHistory(data, "OAuth: cannot bind loopback port (1456-1499)"); return -1; }
+	char *verifier = clOAuthRandomVerifier();
+	if (!verifier) { close(srv); return -1; }
+	char callback[64]; snprintf(callback, sizeof(callback), "http://127.0.0.1:%d", port);
+	char cb_enc[128]; clUrlEncodeInto(callback, cb_enc, sizeof(cb_enc));
+	char url[1024];
+	snprintf(url, sizeof(url),
+		"%s?callback_url=%s&code_challenge=%s&code_challenge_method=plain",
+		CLAW_OR_AUTH_URL, cb_enc, verifier);
+	char line[256];
+	snprintf(line, sizeof(line), "Opening browser. Waiting on %s ...", callback);
+	aiAddHistory(data, line);
+	clOpenUrl(url);
+	char *code = clOAuthLoopbackWait(srv, 300);
+	close(srv);
+	if (!code) { aiAddHistory(data, "OAuth: timed out / no code returned"); free(verifier); return -1; }
+
+	char body[2048];
+	snprintf(body, sizeof(body),
+		"{\"code\":\"%s\",\"code_verifier\":\"%s\",\"code_challenge_method\":\"plain\"}",
+		code, verifier);
+	free(code); free(verifier);
+	char *resp = clCurlPost(CLAW_OR_EXCHANGE_URL, body, NULL);
+	if (!resp) { aiAddHistory(data, "OAuth: exchange failed"); return -1; }
+	char *key = hkExtractJsonString(resp, "key");
+	free(resp);
+	if (!key) { aiAddHistory(data, "OAuth: exchange returned no key"); return -1; }
+	hkApplyProviderAlias("openrouter");
+	free(E.ai_api_key); E.ai_api_key = key;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = NULL;  /* OR key behaves like a paste key */
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+	E.ai_oauth_expires_at = 0;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	aiAddHistory(data, "OpenRouter OAuth: key issued + saved.");
+	return 0;
+#endif
+}
+
+/* Exchange the stored GH access token for a fresh Copilot session token. */
+static int clOAuthCopilotExchange(aiData *data) {
+	if (!E.ai_oauth_refresh) return -1;
+	char hdr[512];
+	snprintf(hdr, sizeof(hdr),
+		"-H 'Authorization: token %s' -H 'Editor-Version: %s' -H 'Editor-Plugin-Version: %s' -H 'User-Agent: GithubCopilot/%s'",
+		E.ai_oauth_refresh, CLAW_COPILOT_EDITOR_VER, CLAW_COPILOT_PLUGIN_VER, CLAW_COPILOT_PLUGIN_VER);
+	char *resp = clCurlGet(CLAW_COPILOT_EXCHANGE_URL, hdr);
+	if (!resp) return -1;
+	char *token = hkExtractJsonString(resp, "token");
+	int expires_at = hkExtractJsonInt(resp, "expires_at");
+	free(resp);
+	if (!token) {
+		if (data) aiAddHistory(data, "OAuth: Copilot token exchange returned no token");
+		return -1;
+	}
+	free(E.ai_api_key); E.ai_api_key = token;
+	E.ai_oauth_expires_at = expires_at > 0 ? (long)expires_at - 30 : (long)time(NULL) + 1500;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	return 0;
+}
+
+static void clUrlEncodeInto(const char *s, char *out, size_t cap) {
+	static const char *hex = "0123456789ABCDEF";
+	size_t j = 0;
+	for (size_t i = 0; s[i] && j + 4 < cap; i++) {
+		unsigned char c = (unsigned char)s[i];
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+			|| c == '-' || c == '_' || c == '.' || c == '~') out[j++] = c;
+		else { out[j++] = '%'; out[j++] = hex[c >> 4]; out[j++] = hex[c & 0xf]; }
+	}
+	out[j] = '\0';
+}
+
+/* SHA-256 + base64url via openssl shell-out. Returns malloc'd string or NULL.
+   openssl ships on macOS/Linux/iSh by default; mingw includes it. Avoids
+   inlining ~120 LOC of SHA-256 + base64url for one call site. */
+static char *clSha256Base64Url(const char *in) {
+	char tmpl[] = "/tmp/hakoc-pkce-XXXXXX";
+	int fd = mkstemp(tmpl);
+	if (fd < 0) return NULL;
+	if (write(fd, in, strlen(in)) < 0) { close(fd); unlink(tmpl); return NULL; }
+	close(fd);
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+		"openssl dgst -sha256 -binary < %s 2>/dev/null | openssl base64 2>/dev/null | tr '+/' '-_' | tr -d '=\\n'",
+		tmpl);
+	FILE *fp = popen(cmd, "r");
+	if (!fp) { unlink(tmpl); return NULL; }
+	char buf[128]; size_t got = fread(buf, 1, sizeof(buf) - 1, fp);
+	pclose(fp); unlink(tmpl);
+	if (got == 0) return NULL;
+	buf[got] = '\0';
+	/* Strip trailing whitespace just in case. */
+	while (got > 0 && (buf[got - 1] == '\n' || buf[got - 1] == '\r' || buf[got - 1] == ' ')) buf[--got] = '\0';
+	return strdup(buf);
+}
+
+/* Anthropic OAuth — PKCE auth-code with manual code paste.
+   Flow: build authorize URL with S256 challenge, open browser, user signs in,
+   Anthropic console shows `<code>#<state>` string, user pastes back, claw
+   exchanges code+verifier for access+refresh tokens. */
+static int clOAuthAnthropic(aiData *data) {
+	const char *client_id = clOAuthClientId("anthropic");
+	if (!client_id) { aiAddHistory(data, "OAuth: no anthropic client_id"); return -1; }
+
+	char *verifier = clOAuthRandomVerifier();
+	if (!verifier) { aiAddHistory(data, "OAuth: verifier gen failed"); return -1; }
+	char *challenge = clSha256Base64Url(verifier);
+	if (!challenge) {
+		aiAddHistory(data, "OAuth: openssl missing — needed for PKCE S256. Install openssl or use API-key paste.");
+		free(verifier); return -1;
+	}
+
+	char cid_enc[256], red_enc[256], scope_enc[256], chal_enc[128], ver_enc[64];
+	clUrlEncodeInto(client_id, cid_enc, sizeof(cid_enc));
+	clUrlEncodeInto(CLAW_ANTHROPIC_REDIRECT, red_enc, sizeof(red_enc));
+	clUrlEncodeInto(CLAW_ANTHROPIC_SCOPE, scope_enc, sizeof(scope_enc));
+	clUrlEncodeInto(challenge, chal_enc, sizeof(chal_enc));
+	clUrlEncodeInto(verifier, ver_enc, sizeof(ver_enc));
+
+	char url[2048];
+	snprintf(url, sizeof(url),
+		"%s?code=true&client_id=%s&response_type=code&redirect_uri=%s&scope=%s&code_challenge=%s&code_challenge_method=S256&state=%s",
+		CLAW_ANTHROPIC_AUTH_URL, cid_enc, red_enc, scope_enc, chal_enc, ver_enc);
+
+	free(challenge);
+
+	aiAddHistory(data, "Sign in at this URL, then paste the code shown:");
+	aiAddHistory(data, url);
+	aiAddHistory(data, "(format: <code>#<state>  — copy the whole string)");
+	clOpenUrl(url);  /* best-effort browser-open; iSh / headless skip silently */
+
+	printf("  paste code (input hidden): ");
+	fflush(stdout);
+	char paste[512];
+	clReadHidden(paste, sizeof(paste));
+	if (!paste[0]) { aiAddHistory(data, "(empty, not saved)"); free(verifier); return -1; }
+
+	/* Anthropic returns `<code>#<state>` — split on '#'. State is verifier. */
+	char *hash = strchr(paste, '#');
+	char *code, *state;
+	if (hash) { *hash = '\0'; code = paste; state = hash + 1; }
+	else      { code = paste; state = verifier; }
+
+	/* Exchange code → tokens (JSON POST). */
+	char body[3072];
+	snprintf(body, sizeof(body),
+		"{\"code\":\"%s\",\"state\":\"%s\",\"grant_type\":\"authorization_code\","
+		"\"client_id\":\"%s\",\"redirect_uri\":\"%s\",\"code_verifier\":\"%s\"}",
+		code, state, client_id, CLAW_ANTHROPIC_REDIRECT, verifier);
+
+	char tmpl[] = "/tmp/hakoc-anth-XXXXXX";
+	int fd = mkstemp(tmpl);
+	if (fd < 0) { aiAddHistory(data, "OAuth: tmp file failed"); free(verifier); return -1; }
+	if (write(fd, body, strlen(body)) < 0) { close(fd); unlink(tmpl); free(verifier); return -1; }
+	close(fd);
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+		"curl -s -X POST %s -A 'hakoCLAW/%s (Claude OAuth client)' -H 'Content-Type: application/json' --data @%s 2>/dev/null",
+		CLAW_ANTHROPIC_TOKEN_URL, CLAW_VERSION, tmpl);
+	FILE *fp = popen(cmd, "r");
+	if (!fp) { unlink(tmpl); free(verifier); aiAddHistory(data, "OAuth: exchange popen failed"); return -1; }
+	size_t cap = 4096, len = 0;
+	char *resp = malloc(cap);
+	size_t n;
+	while ((n = fread(resp + len, 1, cap - len - 1, fp)) > 0) {
+		len += n;
+		if (len + 1 >= cap) { cap *= 2; resp = realloc(resp, cap); }
+	}
+	resp[len] = '\0';
+	pclose(fp);
+	unlink(tmpl);
+	free(verifier);
+
+	char *access = hkExtractJsonString(resp, "access_token");
+	char *refresh = hkExtractJsonString(resp, "refresh_token");
+	int expires = hkExtractJsonInt(resp, "expires_in");
+	if (!access) {
+		char *err = aiExtractApiError(resp);
+		aiAddHistory(data, err ? err : "OAuth: exchange failed (no access_token)");
+		/* Dump raw response for debugging — trim to first 400 chars to keep history clean. */
+		char dbg[480];
+		size_t rl = strlen(resp);
+		snprintf(dbg, sizeof(dbg), "raw: %.400s%s", resp, rl > 400 ? "..." : "");
+		aiAddHistory(data, dbg);
+		free(err); free(refresh); free(resp);
+		return -1;
+	}
+	free(resp);
+
+	free(E.ai_api_key); E.ai_api_key = access;
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = refresh;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("anthropic");
+	E.ai_oauth_expires_at = expires > 0 ? (long)time(NULL) + expires - 30 : 0;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	aiAddHistory(data, "Anthropic OAuth: signed in. Calls now bill against your Claude subscription.");
+	return 0;
+}
+
+/* Random URL-safe verifier from /dev/urandom (or rand fallback). 43 chars (≥256 bits). */
+static char *clOAuthRandomVerifier(void) {
+	static const char alpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	char *out = malloc(48);
+	if (!out) return NULL;
+	unsigned char buf[43];
+	int got = 0;
+#ifndef _WIN32
+	FILE *fp = fopen("/dev/urandom", "rb");
+	if (fp) { got = (int)fread(buf, 1, sizeof(buf), fp); fclose(fp); }
+#endif
+	if (got != (int)sizeof(buf)) {
+		srand((unsigned)(time(NULL) ^ getpid()));
+		for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (unsigned char)(rand() & 0xff);
+	}
+	for (int i = 0; i < 43; i++) out[i] = alpha[buf[i] & 63];
+	out[43] = '\0';
+	return out;
+}
+
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <netinet/in.h>
+#endif
+
+static int clOAuthLoopbackListen(int *out_port) {
+#ifdef _WIN32
+	(void)out_port; return -1;
+#else
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+	int yes = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	for (int p = 1456; p < 1500; p++) {
+		addr.sin_port = htons(p);
+		if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+			if (listen(fd, 1) == 0) { *out_port = p; return fd; }
+		}
+	}
+	close(fd);
+	return -1;
+#endif
+}
+
+static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec) {
+#ifdef _WIN32
+	(void)srv_fd; (void)timeout_sec; return NULL;
+#else
+	struct timeval tv; tv.tv_sec = timeout_sec; tv.tv_usec = 0;
+	fd_set r; FD_ZERO(&r); FD_SET(srv_fd, &r);
+	int n = select(srv_fd + 1, &r, NULL, NULL, &tv);
+	if (n <= 0) return NULL;
+	int c = accept(srv_fd, NULL, NULL);
+	if (c < 0) return NULL;
+	char buf[4096];
+	int got = (int)read(c, buf, sizeof(buf) - 1);
+	if (got <= 0) { close(c); return NULL; }
+	buf[got] = '\0';
+	char *code = NULL;
+	char *p = strstr(buf, "code=");
+	if (p) {
+		p += 5;
+		char *e = p;
+		while (*e && *e != '&' && *e != ' ' && *e != '\r' && *e != '\n') e++;
+		int len = (int)(e - p);
+		code = malloc(len + 1);
+		memcpy(code, p, len);
+		code[len] = '\0';
+	}
+	const char *resp =
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html\r\n"
+		"Connection: close\r\n\r\n"
+		"<!doctype html><meta charset=utf-8><title>hakoCLAW</title>"
+		"<style>body{background:#0a0a08;color:#e8dfc8;font-family:monospace;text-align:center;padding:4em}h1{color:#c9a961}</style>"
+		"<h1>hakoCLAW</h1><p>OAuth complete. Close this tab.</p>";
+	write(c, resp, strlen(resp));
+	close(c);
+	return code;
+#endif
+}
+
+/* Refresh access token. Dispatches by provider:
+   - anthropic: refresh_token grant against console.anthropic.com
+   - github-copilot: re-exchange GH access token for fresh Copilot session token
+*/
+static int clOAuthRefresh(aiData *data) {
+	if (!E.ai_oauth_provider) return -1;
+	if (!strcmp(E.ai_oauth_provider, "github-copilot")) return clOAuthCopilotExchange(data);
+	if (strcmp(E.ai_oauth_provider, "anthropic") != 0) return -1;
+	if (!E.ai_oauth_refresh) return -1;
+	const char *client_id = clOAuthClientId("anthropic");
+	if (!client_id) return -1;
+	char body[3072];
+	snprintf(body, sizeof(body),
+		"{\"grant_type\":\"refresh_token\",\"refresh_token\":\"%s\",\"client_id\":\"%s\"}",
+		E.ai_oauth_refresh, client_id);
+	char tmpl[] = "/tmp/hakoc-rfsh-XXXXXX";
+	int fd = mkstemp(tmpl);
+	if (fd < 0) return -1;
+	if (write(fd, body, strlen(body)) < 0) { close(fd); unlink(tmpl); return -1; }
+	close(fd);
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+		"curl -s -X POST %s -A 'hakoCLAW/%s (Claude OAuth client)' -H 'Content-Type: application/json' --data @%s 2>/dev/null",
+		CLAW_ANTHROPIC_TOKEN_URL, CLAW_VERSION, tmpl);
+	FILE *fp = popen(cmd, "r");
+	if (!fp) { unlink(tmpl); return -1; }
+	size_t cap = 4096, len = 0;
+	char *tr = malloc(cap);
+	size_t n;
+	while ((n = fread(tr + len, 1, cap - len - 1, fp)) > 0) {
+		len += n;
+		if (len + 1 >= cap) { cap *= 2; tr = realloc(tr, cap); }
+	}
+	tr[len] = '\0';
+	pclose(fp);
+	unlink(tmpl);
+
+	char *access = hkExtractJsonString(tr, "access_token");
+	if (!access) {
+		if (data) aiAddHistory(data, "OAuth: refresh failed; run :login anthropic again");
+		free(tr); return -1;
+	}
+	int expires = hkExtractJsonInt(tr, "expires_in");
+	char *new_refresh = hkExtractJsonString(tr, "refresh_token");
+	free(E.ai_api_key); E.ai_api_key = access;
+	if (new_refresh) { free(E.ai_oauth_refresh); E.ai_oauth_refresh = new_refresh; }
+	E.ai_oauth_expires_at = expires > 0 ? (long)time(NULL) + expires - 30 : 0;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	free(tr);
+	return 0;
+}
+
+/* Called before each API turn. Refreshes access token if expired. */
+static void clOAuthEnsureFresh(aiData *data) {
+	if (!E.ai_oauth_provider || !E.ai_oauth_refresh) return;
+	if (E.ai_oauth_expires_at == 0) return;
+	if ((long)time(NULL) < E.ai_oauth_expires_at) return;
+	clOAuthRefresh(data);
 }
 
 /*** self-update (Phase 3) ***/
@@ -3677,7 +5428,7 @@ static void clBanner(aiData *data) {
 		clBoxRow2(INNER, LEFT_W, buf, "");
 	}
 
-	clBoxRow(INNER, "/help for commands  •  ctrl-c cancels stream  •  /quit to exit");
+	clBoxRow(INNER, ":help • :providers • :models • :login <name> • ctrl-c cancel • :q");
 	clBoxBot(INNER);
 	if (E.color_enabled) fputs(ANSI_RESET, stdout);
 	fflush(stdout);
@@ -3953,18 +5704,67 @@ static int clRepl(aiData *data) {
 		hkLoadHistoryTail(data, 40);
 	}
 
+	/* First-launch hint: no provider set + no API key + no Ollama configured = blank slate.
+	   Point user at /providers so they discover the catalog without having to know /login. */
+	if (!E.pipe_mode && E.color_enabled && data->history_count == 0
+		&& E.ai_provider_type == AI_PROVIDER_NONE
+		&& !E.ai_api_key && !E.ai_oauth_refresh && !E.ai_endpoint) {
+		printf("\n  %sno provider configured.%s\n", ANSI_TOOL, ANSI_RESET);
+		printf("  %s:providers%s to browse · %s:login <name>%s to authenticate · %s:login ollama%s for local-only\n\n",
+			ANSI_BOLD, ANSI_RESET, ANSI_BOLD, ANSI_RESET, ANSI_BOLD, ANSI_RESET);
+		fflush(stdout);
+	}
+
 	char line[4096];
 	const char *prompt_color = "\x1b[1m> \x1b[0m";
 	const char *prompt_plain = "> ";
 
 	while (1) {
+		/* Turn separator + status line. Hairline rule appears after an AI turn. */
+		if (E.color_enabled && !E.pipe_mode) {
+			if (E.last_role_shown == HK_ROLE_AI) {
+				printf("%s──────%s\n", ANSI_DIM, ANSI_RESET);
+				E.last_role_shown = HK_ROLE_SYSTEM;
+			}
+		}
+		/* Status line: provider · model · turn · tokens · cost · last-turn ms. Dim chalk, single line. */
+		if (E.color_enabled && !E.pipe_mode) {
+			const char *prov = hkProviderName(E.ai_provider_type);
+			const char *model = E.ai_model ? E.ai_model : "—";
+			char stat[384];
+			char cost_chunk[64]; cost_chunk[0] = '\0';
+			char ms_chunk[32]; ms_chunk[0] = '\0';
+			if (data->last_turn_ms > 0) {
+				if (data->last_turn_ms < 1000) snprintf(ms_chunk, sizeof(ms_chunk), " · %ldms", data->last_turn_ms);
+				else snprintf(ms_chunk, sizeof(ms_chunk), " · %.1fs", data->last_turn_ms / 1000.0);
+			}
+			if (data->total_in_tokens || data->total_out_tokens) {
+				double cost = hkSessionCostUSD(data);
+				const char *flat = hkFreeTierLabel();
+				if (flat) snprintf(cost_chunk, sizeof(cost_chunk), " · %s", flat);
+				else if (cost > 0.00005) snprintf(cost_chunk, sizeof(cost_chunk), " · $%.4f", cost);
+				snprintf(stat, sizeof(stat),
+					"%s· %s · %s · turn %d · ↑%ld ↓%ld%s%s%s",
+					ANSI_DIM, prov ? prov : "—", model,
+					E.session_turn_count,
+					data->total_in_tokens, data->total_out_tokens,
+					cost_chunk, ms_chunk, ANSI_RESET);
+			} else {
+				snprintf(stat, sizeof(stat),
+					"%s· %s · %s · turn %d%s",
+					ANSI_DIM, prov ? prov : "—", model,
+					E.session_turn_count, ANSI_RESET);
+			}
+			printf("%s\n", stat);
+			fflush(stdout);
+		}
 		const char *prompt = E.color_enabled ? prompt_color : prompt_plain;
 		int n = clReadLineRaw(prompt, line, sizeof(line));
 		if (n == -1) { break; }                    /* EOF */
 		if (n == -2) { E.interrupt = 0; continue; }/* Ctrl-C cancel */
 		if (n == 0) continue;
 
-		if (line[0] == '/') {
+		if (line[0] == '/' || line[0] == ':') {
 			int r = hkHandleSlash(data, line);
 			if (r == 2) break;
 			continue;
@@ -4018,6 +5818,17 @@ int main(int argc, char **argv) {
 	clLoadRc();
 	hkLoadSession();
 	clApplyEnv();
+
+	/* Load obfuscated per-provider creds. If hkLoadSession migrated a legacy
+	   plaintext api_key from state, snapshot it into the map then resave state
+	   so the legacy field is dropped on next write. */
+	clCredsLoad();
+	if (E.ai_api_key || E.ai_oauth_refresh) {
+		clCredsCaptureCurrent();
+		clCredsSave();
+	}
+	clCredsRestoreFor(hkProviderName(E.ai_provider_type));
+	hkSaveSession();  /* rewrite state with secrets stripped */
 
 	const char *one_shot = NULL;
 	for (int i = 1; i < argc; i++) {
